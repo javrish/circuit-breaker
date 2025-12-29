@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "lib": ["ES2022"],
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "allowSyntheticDefaultImports": true,
+    "paths": {
+      "@circuit-breaker/core": ["../sdk/packages/core/src/index.ts"],
+      "@circuit-breaker/core/*": ["../sdk/packages/core/src/*"],
+    },
+    "baseUrl": ".",
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules", "dist"],
+}

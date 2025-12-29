@@ -1,0 +1,84 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4f46e5', 'primaryTextColor': '#fff', 'primaryBorderColor': '#3730a3', 'lineColor': '#6366f1', 'actorLineColor': '#6366f1', 'signalColor': '#6366f1'}}}%%
+
+sequenceDiagram
+    autonumber
+
+    participant C as Controller
+    participant N as NATS JetStream
+    participant S as Scheduler
+    participant R as Runner
+    participant D as Dagger Engine
+    participant K as Kubernetes
+
+    Note over C,K: Transition Execution Flow
+
+    rect rgb(240, 253, 244)
+        Note right of C: Phase 1: Enable Transition
+        C->>N: publish(MarkingUpdated)
+        N-->>S: deliver(MarkingUpdated)
+        S->>S: Evaluate firing rules
+        S->>S: Check guard conditions (CEL)
+        S->>S: Verify resource availability
+        S->>N: publish(TransitionEnabled)
+        N->>S: ack()
+    end
+
+    rect rgb(254, 243, 199)
+        Note right of R: Phase 2: Claim & Fire Transition
+        N-->>R: deliver(TransitionEnabled)
+        R->>R: Claim transition (atomic)
+        R->>N: publish(TransitionFired)
+        N->>R: ack()
+        N-->>C: deliver(TransitionFired)
+        C->>C: Consume input tokens
+        C->>N: publish(TokensConsumed)
+        N->>C: ack()
+    end
+
+    rect rgb(219, 234, 254)
+        Note right of D: Phase 3: Execute Task
+        R->>D: Execute pipeline
+        D->>K: Create Pod
+        K-->>D: Pod scheduled
+        D->>D: Run containers
+        Note over D,K: Task execution<br/>(build, test, deploy, etc.)
+        K-->>D: Pod completed
+        D-->>R: Pipeline result
+    end
+
+    rect rgb(243, 232, 255)
+        Note right of C: Phase 4: Complete Transition
+        alt Success
+            R->>N: publish(TransitionCompleted)
+            N-->>C: deliver(TransitionCompleted)
+            C->>C: Produce output tokens
+            C->>N: publish(TokensProduced)
+            C->>N: publish(MarkingUpdated)
+            Note over S: Scheduler evaluates<br/>next enabled transitions
+        else Failure (retryable)
+            R->>N: publish(TransitionFailed)
+            N-->>C: deliver(TransitionFailed)
+            C->>C: Check retry policy
+            C->>C: Increment attempt counter
+            C->>N: publish(TransitionEnabled)
+            Note over R: Runner picks up retry
+        else Failure (terminal)
+            R->>N: publish(TransitionFailed)
+            N-->>C: deliver(TransitionFailed)
+            C->>C: Max retries exceeded
+            C->>N: publish(WorkflowFailed)
+        end
+    end
+
+    rect rgb(254, 226, 226)
+        Note right of C: Phase 5: Check Completion
+        C->>C: Evaluate current marking
+        alt Final marking reached
+            C->>N: publish(WorkflowCompleted)
+        else More work to do
+            Note over S: Scheduler continues<br/>enabling transitions
+        else Deadlock detected
+            C->>N: publish(WorkflowFailed)
+            Note over C: No transitions enabled<br/>but not at final marking
+        end
+    end

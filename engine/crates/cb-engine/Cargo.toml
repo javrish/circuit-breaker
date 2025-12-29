@@ -1,0 +1,54 @@
+[package]
+name = "cb-engine"
+description = "Petri net execution engine for Circuit Breaker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Internal crates
+cb-core = { path = "../cb-core" }
+cb-nats = { path = "../cb-nats" }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Graph algorithms
+petgraph = { workspace = true }
+
+# CEL expression evaluation for guards
+cel-interpreter = { workspace = true }
+
+# State management
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+metrics = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+proptest = { workspace = true }
+
+[features]
+default = []
+# Enable detailed execution tracing
+trace = []
+# Enable state snapshots for debugging
+snapshots = []

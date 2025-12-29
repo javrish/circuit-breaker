@@ -1,0 +1,71 @@
+[package]
+name = "cb-api"
+description = "HTTP/gRPC API server for Circuit Breaker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cb-api"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+cb-core = { path = "../cb-core" }
+cb-engine = { path = "../cb-engine" }
+cb-nats = { path = "../cb-nats" }
+cb-scheduler = { path = "../cb-scheduler" }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# NATS client
+async-nats = { workspace = true }
+
+# Web framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Validation
+jsonschema = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+wiremock = { workspace = true }
+
+[features]
+default = []
+# Enable gRPC support
+grpc = ["dep:tonic", "dep:prost"]
+
+[dependencies.tonic]
+workspace = true
+optional = true
+
+[dependencies.prost]
+workspace = true
+optional = true

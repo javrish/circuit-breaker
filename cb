@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Circuit Breaker CLI wrapper
+# Run from anywhere in the project
+
+set -e
+
+# Find the project root (where this script lives)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Run the CLI via bun
+exec bun run "$SCRIPT_DIR/sdk/packages/cli/src/index.ts" "$@"

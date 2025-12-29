@@ -1,0 +1,41 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "types": ["bun-types"],
+
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+
+    "baseUrl": ".",
+    "paths": {
+      "@circuit-breaker/core": ["./packages/core/src/index.ts"],
+      "@circuit-breaker/cli": ["./packages/cli/src/index.ts"],
+      "@circuit-breaker/dagger": ["./packages/dagger/src/index.ts"]
+    }
+  },
+  "exclude": [
+    "node_modules",
+    "**/dist/**",
+    "**/*.test.ts"
+  ]
+}

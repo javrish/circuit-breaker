@@ -1,0 +1,371 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://circuit-breaker.io/schemas/workflow.json",
+  "title": "Circuit Breaker Workflow",
+  "description": "Petri-net based workflow definition for Circuit Breaker",
+  "type": "object",
+  "required": ["version", "name", "places", "transitions"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "enum": ["1.0"],
+      "description": "Schema version"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*[a-z0-9]$",
+      "minLength": 2,
+      "maxLength": 63,
+      "description": "Workflow name (DNS-compatible)"
+    },
+    "namespace": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*[a-z0-9]$",
+      "default": "default",
+      "description": "Namespace for multi-tenancy"
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    },
+    "places": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/place"
+      },
+      "description": "Places (states) in the Petri net"
+    },
+    "transitions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/transition"
+      },
+      "description": "Transitions (actions) in the Petri net"
+    }
+  },
+  "$defs": {
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "Human-readable description"
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Key-value labels for filtering"
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Arbitrary metadata annotations"
+        }
+      }
+    },
+    "place": {
+      "type": "object",
+      "required": ["id"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]*$",
+          "description": "Unique identifier for the place"
+        },
+        "initialTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Initial token count (marking)"
+        },
+        "capacity": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "default": null,
+          "description": "Maximum token capacity (null = unlimited)"
+        },
+        "tokenSchema": {
+          "$ref": "#/$defs/tokenSchema",
+          "description": "Schema for colored/typed tokens"
+        }
+      }
+    },
+    "tokenSchema": {
+      "type": "object",
+      "description": "JSON Schema for token data (colored Petri nets)",
+      "additionalProperties": true
+    },
+    "transition": {
+      "type": "object",
+      "required": ["id", "inputs", "outputs", "action"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]*$",
+          "description": "Unique identifier for the transition"
+        },
+        "inputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/arc"
+          },
+          "description": "Input arcs from places"
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/arc"
+          },
+          "description": "Output arcs to places"
+        },
+        "guard": {
+          "type": "string",
+          "description": "CEL expression that must evaluate to true for transition to fire"
+        },
+        "action": {
+          "$ref": "#/$defs/action",
+          "description": "Action to execute when transition fires"
+        },
+        "resources": {
+          "$ref": "#/$defs/resources",
+          "description": "Resource requirements for execution"
+        },
+        "timeout": {
+          "type": "string",
+          "pattern": "^[0-9]+(s|m|h)$",
+          "default": "5m",
+          "description": "Execution timeout"
+        },
+        "retries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10,
+          "default": 0,
+          "description": "Number of retry attempts on failure"
+        },
+        "retryBackoff": {
+          "type": "string",
+          "enum": ["fixed", "exponential"],
+          "default": "exponential",
+          "description": "Retry backoff strategy"
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 50,
+          "description": "Priority for scheduling (higher = more priority)"
+        }
+      }
+    },
+    "arc": {
+      "type": "object",
+      "required": ["place"],
+      "additionalProperties": false,
+      "properties": {
+        "place": {
+          "type": "string",
+          "description": "Reference to a place ID"
+        },
+        "weight": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Number of tokens consumed/produced"
+        },
+        "expression": {
+          "type": "string",
+          "description": "CEL expression for token selection (colored nets)"
+        }
+      }
+    },
+    "action": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/daggerAction"
+        },
+        {
+          "$ref": "#/$defs/httpAction"
+        },
+        {
+          "$ref": "#/$defs/scriptAction"
+        },
+        {
+          "$ref": "#/$defs/noopAction"
+        }
+      ]
+    },
+    "daggerAction": {
+      "type": "object",
+      "required": ["type", "module"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "dagger"
+        },
+        "module": {
+          "type": "string",
+          "description": "Path to Dagger module (e.g., './ci' or 'github.com/org/repo/ci')"
+        },
+        "function": {
+          "type": "string",
+          "description": "Function to call in the module"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Arguments to pass to the function"
+        },
+        "image": {
+          "type": "string",
+          "description": "Override container image"
+        },
+        "cache": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Dagger caching"
+        }
+      }
+    },
+    "httpAction": {
+      "type": "object",
+      "required": ["type", "url"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "http"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "HTTP endpoint URL"
+        },
+        "method": {
+          "type": "string",
+          "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+          "default": "POST",
+          "description": "HTTP method"
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "HTTP headers"
+        },
+        "body": {
+          "type": "string",
+          "description": "Request body template (supports CEL interpolation)"
+        },
+        "expectedStatus": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "default": [200, 201, 202, 204],
+          "description": "Expected HTTP status codes for success"
+        }
+      }
+    },
+    "scriptAction": {
+      "type": "object",
+      "required": ["type", "code"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "script"
+        },
+        "runtime": {
+          "type": "string",
+          "enum": ["bun", "deno", "node"],
+          "default": "bun",
+          "description": "JavaScript runtime"
+        },
+        "code": {
+          "type": "string",
+          "description": "Inline script code"
+        },
+        "file": {
+          "type": "string",
+          "description": "Path to script file (alternative to inline code)"
+        }
+      }
+    },
+    "noopAction": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "noop"
+        }
+      },
+      "description": "No-op action for synchronization points (e.g., fan-in joins)"
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu": {
+          "type": "string",
+          "pattern": "^[0-9]+(m|)$",
+          "description": "CPU request (e.g., '100m', '2')"
+        },
+        "memory": {
+          "type": "string",
+          "pattern": "^[0-9]+(Ki|Mi|Gi)$",
+          "description": "Memory request (e.g., '256Mi', '4Gi')"
+        },
+        "gpu": {
+          "type": "string",
+          "description": "GPU request (e.g., 'nvidia.com/gpu: 1')"
+        },
+        "ephemeralStorage": {
+          "type": "string",
+          "pattern": "^[0-9]+(Ki|Mi|Gi)$",
+          "description": "Ephemeral storage request"
+        },
+        "nodeSelector": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Kubernetes node selector labels"
+        },
+        "tolerations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "operator": {
+                "type": "string",
+                "enum": ["Exists", "Equal"]
+              },
+              "value": {
+                "type": "string"
+              },
+              "effect": {
+                "type": "string",
+                "enum": ["NoSchedule", "PreferNoSchedule", "NoExecute"]
+              }
+            }
+          },
+          "description": "Kubernetes tolerations"
+        }
+      }
+    }
+  }
+}

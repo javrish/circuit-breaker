@@ -1,0 +1,79 @@
+{
+  "version": "1.0",
+  "name": "hello-world",
+  "namespace": "examples",
+  "metadata": {
+    "description": "A simple hello world workflow demonstrating sequential execution",
+    "labels": {
+      "example": "true",
+      "complexity": "beginner"
+    }
+  },
+  "places": [
+    {
+      "id": "start",
+      "initialTokens": 1,
+      "capacity": null
+    },
+    {
+      "id": "hello-done",
+      "initialTokens": 0,
+      "capacity": null
+    },
+    {
+      "id": "complete",
+      "initialTokens": 0,
+      "capacity": null
+    }
+  ],
+  "transitions": [
+    {
+      "id": "say-hello",
+      "inputs": [
+        {
+          "place": "start",
+          "weight": 1
+        }
+      ],
+      "outputs": [
+        {
+          "place": "hello-done",
+          "weight": 1
+        }
+      ],
+      "action": {
+        "type": "script",
+        "runtime": "bun",
+        "code": "\n      console.log('Hello');\n      return { message: 'Hello' };\n    "
+      },
+      "timeout": "1m",
+      "retries": 0,
+      "retryBackoff": "exponential",
+      "priority": 50
+    },
+    {
+      "id": "say-world",
+      "inputs": [
+        {
+          "place": "hello-done",
+          "weight": 1
+        }
+      ],
+      "outputs": [
+        {
+          "place": "complete",
+          "weight": 1
+        }
+      ],
+      "action": {
+        "type": "script",
+        "runtime": "bun",
+        "code": "\n      console.log('World!');\n      return { message: 'World!' };\n    "
+      },
+      "timeout": "1m",
+      "retries": 0,
+      "retryBackoff": "exponential",
+      "priority": 50
+    }
+  ]
+}

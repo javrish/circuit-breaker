@@ -1,0 +1,543 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://circuit-breaker.io/schemas/events.json",
+  "title": "Circuit Breaker Events",
+  "description": "Event schemas for the NATS event-driven workflow engine",
+  "definitions": {
+    "eventMetadata": {
+      "type": "object",
+      "required": ["eventId", "timestamp", "version"],
+      "properties": {
+        "eventId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Unique identifier for this event"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp when event was created"
+        },
+        "version": {
+          "type": "string",
+          "const": "1.0",
+          "description": "Event schema version"
+        },
+        "correlationId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "ID to correlate related events"
+        },
+        "causationId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "ID of the event that caused this event"
+        },
+        "source": {
+          "type": "string",
+          "description": "Service that emitted this event"
+        }
+      }
+    },
+    "workflowRef": {
+      "type": "object",
+      "required": ["workflowId", "workflowName"],
+      "properties": {
+        "workflowId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "workflowName": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string",
+          "default": "default"
+        }
+      }
+    },
+    "runRef": {
+      "type": "object",
+      "required": ["runId", "workflowId"],
+      "properties": {
+        "runId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "workflowId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        }
+      }
+    },
+    "transitionRef": {
+      "type": "object",
+      "required": ["transitionId", "runId"],
+      "properties": {
+        "transitionId": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "executionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Unique ID for this specific execution of the transition"
+        }
+      }
+    },
+    "tokenData": {
+      "type": "object",
+      "properties": {
+        "tokenId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "placeId": {
+          "type": "string"
+        },
+        "data": {
+          "type": "object",
+          "description": "Arbitrary token payload (colored Petri net)"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "errorInfo": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Error code for programmatic handling"
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable error message"
+        },
+        "details": {
+          "type": "object",
+          "description": "Additional error context"
+        },
+        "stackTrace": {
+          "type": "string",
+          "description": "Stack trace if available"
+        },
+        "retryable": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "resourceUsage": {
+      "type": "object",
+      "properties": {
+        "cpuMillis": {
+          "type": "integer",
+          "description": "CPU time in milliseconds"
+        },
+        "memoryBytes": {
+          "type": "integer",
+          "description": "Peak memory usage in bytes"
+        },
+        "durationMs": {
+          "type": "integer",
+          "description": "Wall clock duration in milliseconds"
+        }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/definitions/events/workflowSubmitted" },
+    { "$ref": "#/definitions/events/workflowStarted" },
+    { "$ref": "#/definitions/events/workflowCompleted" },
+    { "$ref": "#/definitions/events/workflowFailed" },
+    { "$ref": "#/definitions/events/workflowCancelled" },
+    { "$ref": "#/definitions/events/transitionEnabled" },
+    { "$ref": "#/definitions/events/transitionFired" },
+    { "$ref": "#/definitions/events/transitionCompleted" },
+    { "$ref": "#/definitions/events/transitionFailed" },
+    { "$ref": "#/definitions/events/transitionRetrying" },
+    { "$ref": "#/definitions/events/tokenProduced" },
+    { "$ref": "#/definitions/events/tokenConsumed" },
+    { "$ref": "#/definitions/events/taskDispatched" },
+    { "$ref": "#/definitions/events/taskCompleted" },
+    { "$ref": "#/definitions/events/taskFailed" }
+  ],
+  "definitions/events": {
+    "workflowSubmitted": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "workflow.submitted" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["workflow"],
+          "properties": {
+            "workflow": { "$ref": "workflow.schema.json" },
+            "submittedBy": { "type": "string" },
+            "labels": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "workflowStarted": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "workflow.started" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["workflowRef", "runRef", "initialMarking"],
+          "properties": {
+            "workflowRef": { "$ref": "#/definitions/workflowRef" },
+            "runRef": { "$ref": "#/definitions/runRef" },
+            "initialMarking": {
+              "type": "object",
+              "description": "Map of place IDs to token counts",
+              "additionalProperties": { "type": "integer" }
+            },
+            "inputs": {
+              "type": "object",
+              "description": "Input parameters for this run"
+            },
+            "triggeredBy": {
+              "type": "string",
+              "enum": ["manual", "schedule", "webhook", "event", "api"]
+            }
+          }
+        }
+      }
+    },
+    "workflowCompleted": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "workflow.completed" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["runRef", "finalMarking"],
+          "properties": {
+            "runRef": { "$ref": "#/definitions/runRef" },
+            "finalMarking": {
+              "type": "object",
+              "additionalProperties": { "type": "integer" }
+            },
+            "outputs": {
+              "type": "object",
+              "description": "Output data from terminal places"
+            },
+            "resourceUsage": { "$ref": "#/definitions/resourceUsage" }
+          }
+        }
+      }
+    },
+    "workflowFailed": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "workflow.failed" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["runRef", "error"],
+          "properties": {
+            "runRef": { "$ref": "#/definitions/runRef" },
+            "error": { "$ref": "#/definitions/errorInfo" },
+            "failedTransition": { "type": "string" },
+            "marking": {
+              "type": "object",
+              "additionalProperties": { "type": "integer" }
+            }
+          }
+        }
+      }
+    },
+    "workflowCancelled": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "workflow.cancelled" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["runRef"],
+          "properties": {
+            "runRef": { "$ref": "#/definitions/runRef" },
+            "reason": { "type": "string" },
+            "cancelledBy": { "type": "string" },
+            "marking": {
+              "type": "object",
+              "additionalProperties": { "type": "integer" }
+            }
+          }
+        }
+      }
+    },
+    "transitionEnabled": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "transition.enabled" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["transitionRef", "inputTokens"],
+          "properties": {
+            "transitionRef": { "$ref": "#/definitions/transitionRef" },
+            "inputTokens": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/tokenData" }
+            },
+            "guardResult": {
+              "type": "boolean",
+              "description": "Result of guard expression evaluation"
+            }
+          }
+        }
+      }
+    },
+    "transitionFired": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "transition.fired" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["transitionRef", "consumedTokens"],
+          "properties": {
+            "transitionRef": { "$ref": "#/definitions/transitionRef" },
+            "consumedTokens": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/tokenData" }
+            },
+            "taskId": {
+              "type": "string",
+              "format": "uuid",
+              "description": "ID of the dispatched task"
+            },
+            "runnerId": {
+              "type": "string",
+              "description": "ID of the runner assigned to this task"
+            }
+          }
+        }
+      }
+    },
+    "transitionCompleted": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "transition.completed" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["transitionRef", "producedTokens"],
+          "properties": {
+            "transitionRef": { "$ref": "#/definitions/transitionRef" },
+            "producedTokens": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/tokenData" }
+            },
+            "outputs": {
+              "type": "object",
+              "description": "Action outputs"
+            },
+            "resourceUsage": { "$ref": "#/definitions/resourceUsage" }
+          }
+        }
+      }
+    },
+    "transitionFailed": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "transition.failed" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["transitionRef", "error"],
+          "properties": {
+            "transitionRef": { "$ref": "#/definitions/transitionRef" },
+            "error": { "$ref": "#/definitions/errorInfo" },
+            "attempt": { "type": "integer" },
+            "maxRetries": { "type": "integer" },
+            "willRetry": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "transitionRetrying": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "transition.retrying" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["transitionRef", "attempt", "nextAttemptAt"],
+          "properties": {
+            "transitionRef": { "$ref": "#/definitions/transitionRef" },
+            "attempt": { "type": "integer" },
+            "maxRetries": { "type": "integer" },
+            "nextAttemptAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "backoffMs": { "type": "integer" },
+            "lastError": { "$ref": "#/definitions/errorInfo" }
+          }
+        }
+      }
+    },
+    "tokenProduced": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "token.produced" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["runRef", "token"],
+          "properties": {
+            "runRef": { "$ref": "#/definitions/runRef" },
+            "token": { "$ref": "#/definitions/tokenData" },
+            "producedBy": {
+              "type": "string",
+              "description": "Transition ID that produced this token, or 'initial' for initial marking"
+            }
+          }
+        }
+      }
+    },
+    "tokenConsumed": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "token.consumed" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["runRef", "token"],
+          "properties": {
+            "runRef": { "$ref": "#/definitions/runRef" },
+            "token": { "$ref": "#/definitions/tokenData" },
+            "consumedBy": {
+              "type": "string",
+              "description": "Transition ID that consumed this token"
+            }
+          }
+        }
+      }
+    },
+    "taskDispatched": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "task.dispatched" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId", "transitionRef", "action"],
+          "properties": {
+            "taskId": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "transitionRef": { "$ref": "#/definitions/transitionRef" },
+            "action": {
+              "type": "object",
+              "description": "Action to execute (dagger, http, script, etc.)"
+            },
+            "resources": {
+              "type": "object",
+              "properties": {
+                "cpu": { "type": "string" },
+                "memory": { "type": "string" },
+                "gpu": { "type": "string" }
+              }
+            },
+            "timeout": { "type": "string" },
+            "runnerPool": {
+              "type": "string",
+              "default": "default"
+            }
+          }
+        }
+      }
+    },
+    "taskCompleted": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "task.completed" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId", "transitionRef"],
+          "properties": {
+            "taskId": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "transitionRef": { "$ref": "#/definitions/transitionRef" },
+            "runnerId": { "type": "string" },
+            "outputs": { "type": "object" },
+            "artifacts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "path": { "type": "string" },
+                  "size": { "type": "integer" },
+                  "checksum": { "type": "string" }
+                }
+              }
+            },
+            "resourceUsage": { "$ref": "#/definitions/resourceUsage" }
+          }
+        }
+      }
+    },
+    "taskFailed": {
+      "type": "object",
+      "required": ["type", "metadata", "payload"],
+      "properties": {
+        "type": { "const": "task.failed" },
+        "metadata": { "$ref": "#/definitions/eventMetadata" },
+        "payload": {
+          "type": "object",
+          "required": ["taskId", "transitionRef", "error"],
+          "properties": {
+            "taskId": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "transitionRef": { "$ref": "#/definitions/transitionRef" },
+            "runnerId": { "type": "string" },
+            "error": { "$ref": "#/definitions/errorInfo" },
+            "logs": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

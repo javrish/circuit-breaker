@@ -1,0 +1,33 @@
+{
+  "name": "circuit-breaker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Circuit Breaker - AI-powered workflow orchestration with Petri-net semantics",
+  "workspaces": [
+    "sdk",
+    "sdk/packages/*",
+    "examples"
+  ],
+  "scripts": {
+    "build": "bun run --filter '*' build",
+    "test": "bun run --filter '*' test",
+    "typecheck": "bun run --filter '*' typecheck",
+    "lint": "bun run --filter '*' lint",
+    "fmt": "bun run --filter '*' fmt",
+    "clean": "bun run --filter '*' clean"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.0.0",
+    "typescript": "^5.3.0",
+    "prettier": "^3.2.0",
+    "eslint": "^8.56.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/circuit-breaker/circuit-breaker.git"
+  },
+  "license": "MIT"
+}

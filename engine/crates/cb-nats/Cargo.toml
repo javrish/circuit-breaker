@@ -1,0 +1,41 @@
+[package]
+name = "cb-nats"
+description = "NATS JetStream client and abstractions for Circuit Breaker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Core types
+cb-core = { path = "../cb-core" }
+
+# NATS client
+async-nats = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+testcontainers = { workspace = true }
+
+[features]
+default = []
+# Enable test utilities
+test-utils = []

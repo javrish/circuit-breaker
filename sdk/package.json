@@ -1,0 +1,38 @@
+{
+  "name": "circuit-breaker-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Circuit Breaker SDK - TypeScript SDK for Petri-net workflow orchestration",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "bun run --filter '*' build",
+    "test": "bun run --filter '*' test",
+    "lint": "bun run --filter '*' lint",
+    "fmt": "bun run --filter '*' fmt",
+    "typecheck": "bun run --filter '*' typecheck",
+    "clean": "bun run --filter '*' clean",
+    "schema:gen": "bun run scripts/generate-types.ts",
+    "docs": "typedoc --out docs packages/*/src/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.0.0",
+    "typescript": "^5.3.0",
+    "typedoc": "^0.25.0",
+    "prettier": "^3.2.0",
+    "eslint": "^8.56.0",
+    "@typescript-eslint/eslint-plugin": "^6.19.0",
+    "@typescript-eslint/parser": "^6.19.0",
+    "json-schema-to-typescript": "^13.1.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/circuit-breaker/circuit-breaker.git",
+    "directory": "sdk"
+  },
+  "license": "MIT"
+}

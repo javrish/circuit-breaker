@@ -1,0 +1,101 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4f46e5', 'primaryTextColor': '#fff', 'primaryBorderColor': '#3730a3', 'lineColor': '#6366f1', 'secondaryColor': '#f0fdf4', 'tertiaryColor': '#fef3c7'}}}%%
+
+flowchart TB
+    subgraph Sources["External Event Sources"]
+        direction LR
+        GitHub[GitHub<br/>Webhooks]
+        GitLab[GitLab<br/>Webhooks]
+        Kafka[Apache<br/>Kafka]
+        AWS[AWS<br/>EventBridge]
+        GCP[Google<br/>Pub/Sub]
+        Custom[Custom<br/>Applications]
+    end
+
+    subgraph Ingestion["Event Ingestion Layer"]
+        direction TB
+
+        subgraph Adapters["Protocol Adapters"]
+            WebhookServer[Webhook Server<br/>cb-webhook]
+            KafkaConsumer[Kafka Consumer<br/>cb-kafka]
+            CloudAdapter[Cloud Adapter<br/>cb-cloud]
+        end
+
+        Normalizer[Event Normalizer<br/>CloudEvents Format]
+
+        subgraph Matching["Trigger Processing"]
+            TriggerMatcher[Trigger Matcher<br/>CEL Evaluation]
+            InputMapper[Input Mapper<br/>Template Rendering]
+        end
+    end
+
+    subgraph NATS["NATS JetStream"]
+        direction LR
+        ExternalStream[(EXTERNAL_EVENTS<br/>Stream)]
+        WorkflowStream[(WORKFLOWS<br/>Stream)]
+        RunStream[(RUNS<br/>Stream)]
+    end
+
+    subgraph Core["Circuit Breaker Core"]
+        direction LR
+        Controller[Controller]
+        Scheduler[Scheduler]
+        Runners[Runners]
+    end
+
+    subgraph Execution["Execution"]
+        Dagger[Dagger Engine]
+        K8s[Kubernetes]
+    end
+
+    %% Source connections to adapters
+    GitHub -->|POST /webhook| WebhookServer
+    GitLab -->|POST /webhook| WebhookServer
+    Kafka -->|consume| KafkaConsumer
+    AWS -->|SQS/EventBridge| CloudAdapter
+    GCP -->|Pub/Sub| CloudAdapter
+    Custom -->|POST /events| WebhookServer
+
+    %% Adapter to normalizer
+    WebhookServer --> Normalizer
+    KafkaConsumer --> Normalizer
+    CloudAdapter --> Normalizer
+
+    %% Normalizer to NATS (raw events)
+    Normalizer -->|Raw CloudEvent| ExternalStream
+
+    %% NATS to trigger matching
+    ExternalStream --> TriggerMatcher
+
+    %% Trigger processing
+    TriggerMatcher -->|Matched Event| InputMapper
+    InputMapper -->|WorkflowSubmitted| WorkflowStream
+
+    %% Core processing
+    WorkflowStream --> Controller
+    Controller -->|MarkingUpdated| RunStream
+    RunStream --> Scheduler
+    Scheduler -->|TransitionEnabled| RunStream
+    RunStream --> Runners
+
+    %% Execution
+    Runners --> Dagger
+    Dagger --> K8s
+
+    %% Feedback loop
+    Runners -->|TransitionCompleted| RunStream
+    RunStream -->|subscribe| Controller
+
+    %% Styling
+    classDef source fill:#dbeafe,stroke:#3b82f6,color:#1e40af
+    classDef adapter fill:#fef3c7,stroke:#f59e0b,color:#92400e
+    classDef processing fill:#f3e8ff,stroke:#a855f7,color:#6b21a8
+    classDef nats fill:#dcfce7,stroke:#22c55e,color:#166534
+    classDef core fill:#fee2e2,stroke:#ef4444,color:#991b1b
+    classDef exec fill:#f1f5f9,stroke:#64748b,color:#334155
+
+    class GitHub,GitLab,Kafka,AWS,GCP,Custom source
+    class WebhookServer,KafkaConsumer,CloudAdapter adapter
+    class Normalizer,TriggerMatcher,InputMapper processing
+    class ExternalStream,WorkflowStream,RunStream nats
+    class Controller,Scheduler,Runners core
+    class Dagger,K8s exec

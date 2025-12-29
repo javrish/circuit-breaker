@@ -1,0 +1,248 @@
+# Karpenter NodePool configuration for Circuit Breaker Dagger runners
+# https://karpenter.sh/docs/concepts/nodepools/
+---
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: circuit-breaker-runners
+  labels:
+    app.kubernetes.io/name: circuit-breaker
+    app.kubernetes.io/component: runner
+spec:
+  # Template for nodes provisioned by this NodePool
+  template:
+    metadata:
+      labels:
+        circuit-breaker.io/node-type: runner
+    spec:
+      requirements:
+        # Allow both spot and on-demand instances (prefer spot for cost)
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+
+        # Instance architectures
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+
+        # Instance categories optimized for CI/CD workloads
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["m", "c", "r"]  # General purpose, compute, memory
+
+        # Instance generations (newer = better price/performance)
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["5"]
+
+        # Instance sizes for runner workloads
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["large", "xlarge", "2xlarge", "4xlarge"]
+
+      # Reference to EC2NodeClass
+      nodeClassRef:
+        name: circuit-breaker-runner-class
+
+      # Taints to ensure only runner pods land on these nodes
+      taints:
+        - key: circuit-breaker.io/runner
+          value: "true"
+          effect: NoSchedule
+
+  # Limits for this NodePool
+  limits:
+    cpu: 1000        # Max 1000 vCPUs across all nodes
+    memory: 2000Gi   # Max 2TB memory across all nodes
+
+  # Disruption settings for cost optimization
+  disruption:
+    # Consolidate when nodes are underutilized
+    consolidationPolicy: WhenUnderutilized
+
+    # Wait this long after a node becomes empty before terminating
+    consolidateAfter: 30s
+
+    # Budget for voluntary disruption
+    budgets:
+      - nodes: "10%"  # Allow disrupting 10% of nodes at a time
+
+  # Weight for multi-NodePool scheduling (higher = preferred)
+  weight: 100
+
+---
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: circuit-breaker-runner-class
+  labels:
+    app.kubernetes.io/name: circuit-breaker
+    app.kubernetes.io/component: runner
+spec:
+  # AMI selection - use Bottlerocket for container-optimized performance
+  amiFamily: Bottlerocket
+
+  # Subnet discovery via tags
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "true"
+        # Or use specific tags for your cluster
+        # kubernetes.io/cluster/YOUR_CLUSTER_NAME: "owned"
+
+  # Security group discovery via tags
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "true"
+
+  # IAM instance profile for nodes
+  instanceProfile: KarpenterNodeInstanceProfile-circuit-breaker
+
+  # Block device mappings for storage
+  blockDeviceMappings:
+    # Root volume
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 50Gi
+        volumeType: gp3
+        iops: 3000
+        throughput: 125
+        encrypted: true
+        deleteOnTermination: true
+
+    # Data volume for Dagger cache and container layers
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: 200Gi
+        volumeType: gp3
+        iops: 6000
+        throughput: 500
+        encrypted: true
+        deleteOnTermination: true
+
+  # User data for node initialization (Bottlerocket TOML format)
+  userData: |
+    [settings.kubernetes]
+    cluster-name = "circuit-breaker"
+
+    [settings.kubernetes.node-labels]
+    "circuit-breaker.io/node-type" = "runner"
+
+    [settings.kubernetes.node-taints]
+    "circuit-breaker.io/runner" = "true:NoSchedule"
+
+    # Enable container runtime optimizations
+    [settings.container-runtime]
+    max-container-log-line-size = 32768
+
+    # Mount the data volume for Dagger cache
+    [settings.host-containers.admin]
+    enabled = true
+
+  # Metadata options
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 2
+    httpTokens: required  # Require IMDSv2
+
+  # Tags applied to EC2 instances
+  tags:
+    Application: circuit-breaker
+    Component: runner
+    ManagedBy: karpenter
+
+---
+# NodePool for GPU workloads (optional)
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: circuit-breaker-gpu-runners
+  labels:
+    app.kubernetes.io/name: circuit-breaker
+    app.kubernetes.io/component: gpu-runner
+spec:
+  template:
+    metadata:
+      labels:
+        circuit-breaker.io/node-type: gpu-runner
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]  # GPUs are better on-demand
+
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+
+        # GPU instance types
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["g", "p"]  # GPU instances
+
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["xlarge", "2xlarge", "4xlarge"]
+
+      nodeClassRef:
+        name: circuit-breaker-gpu-class
+
+      taints:
+        - key: nvidia.com/gpu
+          value: "true"
+          effect: NoSchedule
+        - key: circuit-breaker.io/gpu-runner
+          value: "true"
+          effect: NoSchedule
+
+  limits:
+    cpu: 100
+    memory: 400Gi
+    # Note: GPU limits are managed via instance count
+
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 5m
+
+  weight: 50
+
+---
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: circuit-breaker-gpu-class
+spec:
+  amiFamily: AL2  # GPU support requires Amazon Linux 2
+
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "true"
+
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "true"
+
+  instanceProfile: KarpenterNodeInstanceProfile-circuit-breaker
+
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        encrypted: true
+        deleteOnTermination: true
+
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: 500Gi  # Larger for ML models
+        volumeType: gp3
+        iops: 10000
+        throughput: 750
+        encrypted: true
+        deleteOnTermination: true
+
+  tags:
+    Application: circuit-breaker
+    Component: gpu-runner
+    ManagedBy: karpenter

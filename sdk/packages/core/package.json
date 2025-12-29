@@ -1,0 +1,55 @@
+{
+  "name": "@circuit-breaker/core",
+  "version": "0.1.0",
+  "description": "Core types and workflow builder for Circuit Breaker",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./schema": {
+      "import": "./dist/schema.js",
+      "types": "./dist/schema.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target node",
+    "dev": "bun run --watch src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/",
+    "fmt": "prettier --write src/",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.0.0",
+    "typescript": "^5.3.0"
+  },
+  "peerDependencies": {
+    "typescript": ">=5.0.0"
+  },
+  "keywords": [
+    "circuit-breaker",
+    "workflow",
+    "petri-net",
+    "orchestration",
+    "dagger"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/circuit-breaker/circuit-breaker.git",
+    "directory": "sdk/packages/core"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,59 @@
+[package]
+name = "cb-runner"
+description = "Dagger task runner for Circuit Breaker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cb-runner"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+cb-core = { path = "../cb-core" }
+cb-nats = { path = "../cb-nats" }
+
+# NATS client
+async-nats = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+url = { workspace = true }
+base64 = { workspace = true }
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json"] }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+metrics = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+
+[features]
+default = []
+# Enable local Dagger engine (vs connecting to remote)
+local-engine = []
+# Enable GPU support
+gpu = []

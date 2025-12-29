@@ -1,0 +1,39 @@
+# Bun configuration for Circuit Breaker SDK
+# https://bun.sh/docs/runtime/bunfig
+
+[install]
+# Use exact versions for reproducibility
+exact = true
+
+# Registry configuration
+registry = "https://registry.npmjs.org"
+
+[install.lockfile]
+# Save lockfile
+save = true
+
+[run]
+# Silent mode for cleaner output in scripts
+# silent = true
+
+[test]
+# Test configuration
+coverage = true
+coverageDir = "coverage"
+
+# Test file patterns
+include = ["**/*.test.ts", "**/*.spec.ts"]
+exclude = ["node_modules", "dist"]
+
+# Timeout for individual tests (ms)
+timeout = 30000
+
+[bundle]
+# Bundle configuration for production builds
+minify = true
+sourcemap = "external"
+target = "node"
+
+[define]
+# Global defines
+"process.env.NODE_ENV" = "'development'"

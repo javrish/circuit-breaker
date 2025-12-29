@@ -1,0 +1,48 @@
+{
+  "name": "@circuit-breaker/cli",
+  "version": "0.1.0",
+  "description": "CLI for Circuit Breaker workflow orchestration",
+  "type": "module",
+  "bin": {
+    "cb": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target node --external commander --external chalk --external ora",
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/",
+    "fmt": "prettier --write src/",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@circuit-breaker/core": "workspace:*",
+    "commander": "^12.0.0",
+    "chalk": "^5.3.0",
+    "ora": "^8.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.0.0",
+    "typescript": "^5.3.0"
+  },
+  "keywords": [
+    "circuit-breaker",
+    "cli",
+    "workflow",
+    "petri-net",
+    "orchestration"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/circuit-breaker/circuit-breaker.git",
+    "directory": "sdk/packages/cli"
+  },
+  "license": "MIT"
+}

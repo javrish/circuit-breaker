@@ -1,0 +1,89 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4f46e5', 'primaryTextColor': '#fff', 'primaryBorderColor': '#3730a3', 'lineColor': '#6366f1', 'secondaryColor': '#f0fdf4', 'tertiaryColor': '#fef3c7'}}}%%
+
+flowchart TB
+    subgraph Client["Client Layer"]
+        CLI[CLI<br/>cb submit]
+        SDK[TypeScript SDK]
+    end
+
+    subgraph API["API Layer"]
+        APIServer[API Server<br/>cb-api]
+    end
+
+    subgraph EventBus["Event Bus - NATS JetStream"]
+        direction TB
+        WFStream[(WORKFLOWS<br/>Stream)]
+        RunStream[(RUNS<br/>Stream)]
+        SysStream[(SYSTEM<br/>Stream)]
+    end
+
+    subgraph Control["Control Plane"]
+        Controller[Controller<br/>cb-controller]
+        Scheduler[Scheduler<br/>cb-scheduler]
+    end
+
+    subgraph Execution["Execution Plane"]
+        Runner1[Runner 1<br/>cb-runner]
+        Runner2[Runner 2<br/>cb-runner]
+        RunnerN[Runner N<br/>cb-runner]
+    end
+
+    subgraph Infra["Infrastructure"]
+        Dagger[Dagger Engine]
+        K8s[Kubernetes<br/>Pods]
+        Karpenter[Karpenter<br/>Autoscaler]
+    end
+
+    %% Client to API
+    CLI -->|POST /workflows| APIServer
+    SDK -->|POST /workflows| APIServer
+
+    %% API to Event Bus
+    APIServer -->|WorkflowSubmitted| WFStream
+
+    %% Controller subscriptions and publications
+    WFStream -->|subscribe| Controller
+    Controller -->|WorkflowStarted<br/>WorkflowCompleted<br/>WorkflowFailed| WFStream
+    Controller -->|MarkingUpdated| RunStream
+
+    %% Scheduler subscriptions and publications
+    RunStream -->|subscribe<br/>MarkingUpdated| Scheduler
+    WFStream -->|subscribe<br/>WorkflowStarted| Scheduler
+    Scheduler -->|TransitionEnabled| RunStream
+
+    %% Runner subscriptions and publications
+    RunStream -->|subscribe<br/>TransitionEnabled| Runner1
+    RunStream -->|subscribe<br/>TransitionEnabled| Runner2
+    RunStream -->|subscribe<br/>TransitionEnabled| RunnerN
+
+    Runner1 -->|TransitionFired<br/>TransitionCompleted<br/>TransitionFailed| RunStream
+    Runner2 -->|TransitionFired<br/>TransitionCompleted<br/>TransitionFailed| RunStream
+    RunnerN -->|TransitionFired<br/>TransitionCompleted<br/>TransitionFailed| RunStream
+
+    %% Runner to Infrastructure
+    Runner1 --> Dagger
+    Runner2 --> Dagger
+    RunnerN --> Dagger
+    Dagger --> K8s
+
+    %% Karpenter scaling
+    RunStream -.->|pending events| Karpenter
+    Karpenter -.->|scale| K8s
+
+    %% Controller processes transition results
+    RunStream -->|subscribe<br/>TransitionCompleted| Controller
+
+    %% Styling
+    classDef client fill:#dbeafe,stroke:#3b82f6,color:#1e40af
+    classDef api fill:#fef3c7,stroke:#f59e0b,color:#92400e
+    classDef eventbus fill:#dcfce7,stroke:#22c55e,color:#166534
+    classDef control fill:#f3e8ff,stroke:#a855f7,color:#6b21a8
+    classDef execution fill:#fee2e2,stroke:#ef4444,color:#991b1b
+    classDef infra fill:#f1f5f9,stroke:#64748b,color:#334155
+
+    class CLI,SDK client
+    class APIServer api
+    class WFStream,RunStream,SysStream eventbus
+    class Controller,Scheduler control
+    class Runner1,Runner2,RunnerN execution
+    class Dagger,K8s,Karpenter infra

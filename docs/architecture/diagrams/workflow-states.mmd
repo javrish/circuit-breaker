@@ -1,0 +1,69 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4f46e5', 'primaryTextColor': '#fff', 'primaryBorderColor': '#3730a3', 'lineColor': '#6366f1'}}}%%
+
+stateDiagram-v2
+    [*] --> Submitted: WorkflowSubmitted
+
+    Submitted --> Pending: Validated
+    Submitted --> Rejected: ValidationFailed
+
+    Pending --> Running: WorkflowStarted
+    Pending --> Cancelled: CancellationRequested
+
+    Running --> Running: TransitionCompleted<br/>(more transitions enabled)
+    Running --> Completed: FinalMarkingReached
+    Running --> Failed: UnrecoverableError
+    Running --> Cancelled: CancellationRequested
+
+    Completed --> [*]
+    Failed --> [*]
+    Cancelled --> [*]
+    Rejected --> [*]
+
+    state Running {
+        [*] --> Evaluating: Initialize Marking
+
+        Evaluating --> Executing: TransitionsEnabled
+        Evaluating --> CheckComplete: NoTransitionsEnabled
+
+        Executing --> WaitingForCompletion: TransitionsFired
+        WaitingForCompletion --> Evaluating: TransitionCompleted
+        WaitingForCompletion --> HandleFailure: TransitionFailed
+
+        HandleFailure --> Evaluating: RetrySucceeded
+        HandleFailure --> [*]: MaxRetriesExceeded
+
+        CheckComplete --> [*]: IsFinalMarking
+        CheckComplete --> Deadlocked: NotFinalMarking
+
+        Deadlocked --> [*]: ReportDeadlock
+    }
+
+    note right of Submitted
+        Workflow definition received
+        by API server
+    end note
+
+    note right of Pending
+        Workflow validated and stored,
+        waiting for run command
+    end note
+
+    note right of Running
+        Petri net execution in progress,
+        tokens flowing through places
+    end note
+
+    note right of Completed
+        Final marking reached,
+        all outputs produced
+    end note
+
+    note right of Failed
+        Unrecoverable error occurred,
+        workflow terminated
+    end note
+
+    note right of Cancelled
+        User requested cancellation,
+        cleanup performed
+    end note
