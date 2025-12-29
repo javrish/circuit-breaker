@@ -628,6 +628,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "cb-webhook"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "axum 0.8.8",
+ "base64 0.21.7",
+ "bytes",
+ "cb-core",
+ "cb-nats",
+ "cel-interpreter",
+ "chrono",
+ "clap",
+ "dashmap",
+ "futures",
+ "hex",
+ "hmac",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tower 0.5.2",
+ "tower-http 0.6.8",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.51"
 source = "registry+https://github.com/rust-lang/crates.io-index"

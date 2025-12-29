@@ -1,0 +1,257 @@
+# Multi-Source Webhook Configuration for Circuit Breaker
+#
+# This configuration demonstrates how to set up multiple webhook endpoints
+# for different services (GitHub, GitLab, Docker Hub, Stripe) in a single file.
+#
+# Usage:
+#   cb-webhook --config ./multi-source.yaml --nats-url nats://localhost:4222
+#
+# Each endpoint can have its own authentication, triggers, and rate limits.
+
+---
+# GitHub Webhook Endpoint
+apiVersion: circuitbreaker.io/v1
+kind: WebhookEndpoint
+metadata:
+  name: github
+  namespace: default
+  labels:
+    source: github
+spec:
+  path: /webhooks/github
+  sourceType: github
+  auth:
+    type: hmac-sha256
+    secretRef:
+      name: github-webhook-secret
+      key: secret
+    headerName: X-Hub-Signature-256
+    signaturePrefix: "sha256="
+  maxPayloadBytes: 10485760
+  rateLimit:
+    requests: 100
+    period: 1m
+  triggers:
+    - event: push
+      workflow: github-build
+      inputs:
+        repository: "{{ .repository.full_name }}"
+        commit: "{{ .head_commit.id }}"
+        ref: "{{ .ref }}"
+    - event: pull_request
+      workflow: github-pr-check
+      inputs:
+        repository: "{{ .repository.full_name }}"
+        prNumber: "{{ .number }}"
+        action: "{{ .action }}"
+  enabled: true
+
+---
+# GitLab Webhook Endpoint
+apiVersion: circuitbreaker.io/v1
+kind: WebhookEndpoint
+metadata:
+  name: gitlab
+  namespace: default
+  labels:
+    source: gitlab
+spec:
+  path: /webhooks/gitlab
+  sourceType: gitlab
+  auth:
+    # GitLab uses a secret token in a custom header
+    type: bearer-token
+    secretRef:
+      name: gitlab-webhook-secret
+      key: token
+    headerName: X-Gitlab-Token
+  maxPayloadBytes: 10485760
+  rateLimit:
+    requests: 100
+    period: 1m
+  triggers:
+    - event: "Push Hook"
+      workflow: gitlab-build
+      inputs:
+        project: "{{ .project.path_with_namespace }}"
+        commit: "{{ .checkout_sha }}"
+        ref: "{{ .ref }}"
+        branch: "{{ .ref }}"
+    - event: "Merge Request Hook"
+      workflow: gitlab-mr-check
+      inputs:
+        project: "{{ .project.path_with_namespace }}"
+        mrId: "{{ .object_attributes.iid }}"
+        action: "{{ .object_attributes.action }}"
+        sourceBranch: "{{ .object_attributes.source_branch }}"
+        targetBranch: "{{ .object_attributes.target_branch }}"
+    - event: "Pipeline Hook"
+      workflow: gitlab-pipeline-notify
+      inputs:
+        project: "{{ .project.path_with_namespace }}"
+        pipelineId: "{{ .object_attributes.id }}"
+        status: "{{ .object_attributes.status }}"
+  enabled: true
+
+---
+# Docker Hub Webhook Endpoint
+apiVersion: circuitbreaker.io/v1
+kind: WebhookEndpoint
+metadata:
+  name: dockerhub
+  namespace: default
+  labels:
+    source: dockerhub
+spec:
+  path: /webhooks/dockerhub
+  sourceType: dockerhub
+  # Docker Hub doesn't support webhook authentication by default
+  # Consider using IP allowlist or a custom callback URL with token
+  auth:
+    type: bearer-token
+    secretRef:
+      name: dockerhub-webhook-secret
+      key: token
+    headerName: Authorization
+  maxPayloadBytes: 1048576
+  rateLimit:
+    requests: 50
+    period: 1m
+  triggers:
+    - event: push
+      workflow: deploy-image
+      inputs:
+        repository: "{{ .repository.repo_name }}"
+        tag: "{{ .push_data.tag }}"
+        pusher: "{{ .push_data.pusher }}"
+        pushedAt: "{{ .push_data.pushed_at }}"
+  enabled: true
+
+---
+# Stripe Webhook Endpoint
+apiVersion: circuitbreaker.io/v1
+kind: WebhookEndpoint
+metadata:
+  name: stripe
+  namespace: default
+  labels:
+    source: stripe
+spec:
+  path: /webhooks/stripe
+  sourceType: stripe
+  auth:
+    type: hmac-sha256
+    secretRef:
+      name: stripe-webhook-secret
+      key: signing-secret
+    headerName: Stripe-Signature
+    # Stripe uses a complex signature format with timestamp
+    # The auth module handles this specially for Stripe
+  maxPayloadBytes: 1048576
+  rateLimit:
+    requests: 200
+    period: 1m
+  triggers:
+    - event: checkout.session.completed
+      workflow: process-payment
+      inputs:
+        sessionId: "{{ .data.object.id }}"
+        customerId: "{{ .data.object.customer }}"
+        amount: "{{ .data.object.amount_total }}"
+        currency: "{{ .data.object.currency }}"
+    - event: customer.subscription.created
+      workflow: provision-subscription
+      inputs:
+        subscriptionId: "{{ .data.object.id }}"
+        customerId: "{{ .data.object.customer }}"
+        planId: "{{ .data.object.plan.id }}"
+        status: "{{ .data.object.status }}"
+    - event: customer.subscription.deleted
+      workflow: deprovision-subscription
+      inputs:
+        subscriptionId: "{{ .data.object.id }}"
+        customerId: "{{ .data.object.customer }}"
+    - event: invoice.payment_failed
+      workflow: handle-payment-failure
+      inputs:
+        invoiceId: "{{ .data.object.id }}"
+        customerId: "{{ .data.object.customer }}"
+        amount: "{{ .data.object.amount_due }}"
+        attemptCount: "{{ .data.object.attempt_count }}"
+  enabled: true
+
+---
+# Slack Webhook Endpoint (for slash commands and interactive messages)
+apiVersion: circuitbreaker.io/v1
+kind: WebhookEndpoint
+metadata:
+  name: slack
+  namespace: default
+  labels:
+    source: slack
+spec:
+  path: /webhooks/slack
+  sourceType: slack
+  auth:
+    type: hmac-sha256
+    secretRef:
+      name: slack-signing-secret
+      key: secret
+    headerName: X-Slack-Signature
+    signaturePrefix: "v0="
+  maxPayloadBytes: 1048576
+  rateLimit:
+    requests: 100
+    period: 1m
+  triggers:
+    - event: slash_command
+      workflow: slack-command-handler
+      inputs:
+        command: "{{ .command }}"
+        text: "{{ .text }}"
+        userId: "{{ .user_id }}"
+        channelId: "{{ .channel_id }}"
+        responseUrl: "{{ .response_url }}"
+    - event: interactive_message
+      workflow: slack-interaction-handler
+      inputs:
+        actionId: "{{ .actions[0].action_id }}"
+        userId: "{{ .user.id }}"
+        value: "{{ .actions[0].value }}"
+        responseUrl: "{{ .response_url }}"
+  enabled: true
+
+---
+# Generic Webhook Endpoint (for custom integrations)
+apiVersion: circuitbreaker.io/v1
+kind: WebhookEndpoint
+metadata:
+  name: custom
+  namespace: default
+  labels:
+    source: custom
+spec:
+  path: /webhooks/custom
+  sourceType: generic
+  auth:
+    type: bearer-token
+    secretRef:
+      name: custom-webhook-secret
+      key: token
+  maxPayloadBytes: 5242880
+  rateLimit:
+    requests: 50
+    period: 1m
+  # IP allowlist for trusted sources
+  ipAllowlist:
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+  triggers:
+    # Catch-all trigger for any event
+    - event: "*"
+      workflow: generic-event-handler
+      inputs:
+        eventType: "{{ .event }}"
+        payload: "{{ . }}"
+  enabled: true

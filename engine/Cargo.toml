@@ -8,6 +8,7 @@ members = [
     "crates/cb-controller",
     "crates/cb-api",
     "crates/cb-runner",
+    "crates/cb-webhook",
 ]
 
 [workspace.package]
@@ -74,6 +75,10 @@ async-trait = "0.1"
 bytes = "1.5"
 url = "2.5"
 base64 = "0.21"
+serde_yaml = "0.9"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 
 # CLI
 clap = { version = "4.4", features = ["derive", "env"] }

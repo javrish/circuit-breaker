@@ -1,0 +1,75 @@
+[package]
+name = "cb-webhook"
+description = "Webhook server for Circuit Breaker event ingestion"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cb-webhook"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+cb-core = { path = "../cb-core" }
+cb-nats = { path = "../cb-nats" }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# NATS client
+async-nats = { workspace = true }
+
+# Web framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+
+# Crypto for webhook signature validation
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# CEL expressions for filtering
+cel-interpreter = { workspace = true }
+
+# YAML parsing for configuration
+serde_yaml = { workspace = true }
+
+# Async traits
+async-trait = { workspace = true }
+
+# Concurrent data structures
+dashmap = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+wiremock = { workspace = true }
+
+[features]
+default = []

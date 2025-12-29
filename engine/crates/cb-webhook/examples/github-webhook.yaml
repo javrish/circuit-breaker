@@ -1,0 +1,146 @@
+# Example GitHub Webhook Configuration for Circuit Breaker
+#
+# This configuration sets up a webhook endpoint to receive GitHub events
+# and trigger workflows based on push and pull request events.
+#
+# Usage:
+#   cb-webhook --config ./github-webhook.yaml --nats-url nats://localhost:4222
+#
+# To configure GitHub:
+#   1. Go to your repository Settings > Webhooks > Add webhook
+#   2. Set Payload URL to: https://your-domain.com/webhooks/github
+#   3. Set Content type to: application/json
+#   4. Set Secret to match the value in your Kubernetes secret
+#   5. Select events: Push, Pull requests
+
+apiVersion: circuitbreaker.io/v1
+kind: WebhookEndpoint
+metadata:
+  name: github
+  namespace: production
+  labels:
+    app: circuit-breaker
+    source: github
+spec:
+  # URL path where webhooks will be received
+  path: /webhooks/github
+
+  # Source type helps with auto-detection and normalization
+  sourceType: github
+
+  # Authentication using HMAC-SHA256 (GitHub's default)
+  auth:
+    type: hmac-sha256
+    # For production, use a Kubernetes secret reference:
+    secretRef:
+      name: github-webhook-secret
+      key: webhook-secret
+    # For local development, you can use an inline secret (not recommended for production):
+    # secret: "your-webhook-secret-here"
+
+    # GitHub uses this header for the signature
+    headerName: X-Hub-Signature-256
+    signaturePrefix: "sha256="
+
+  # Maximum payload size (GitHub recommends 25MB max, we default to 10MB)
+  maxPayloadBytes: 10485760
+
+  # Rate limiting to prevent abuse
+  rateLimit:
+    requests: 100
+    period: 1m
+    key: source.ip
+
+  # Optional: IP allowlist for GitHub's webhook IPs
+  # See: https://api.github.com/meta for current IP ranges
+  # ipAllowlist:
+  #   - "192.30.252.0/22"
+  #   - "185.199.108.0/22"
+  #   - "140.82.112.0/20"
+  #   - "143.55.64.0/20"
+
+  # Trigger mappings - define which events trigger which workflows
+  triggers:
+    # Trigger build-and-deploy workflow on pushes to main branch
+    - event: push
+      filter:
+        ref: "refs/heads/main"
+      workflow: build-and-deploy
+      workflowNamespace: production
+      inputs:
+        repository: "{{ .repository.full_name }}"
+        commit: "{{ .head_commit.id }}"
+        branch: "{{ .ref }}"
+        author: "{{ .head_commit.author.email }}"
+        message: "{{ .head_commit.message }}"
+
+    # Trigger build-and-deploy for release tags
+    - event: push
+      filter:
+        ref: "refs/tags/v*"
+      workflow: release-deploy
+      workflowNamespace: production
+      inputs:
+        repository: "{{ .repository.full_name }}"
+        tag: "{{ .ref }}"
+        commit: "{{ .head_commit.id }}"
+
+    # Trigger PR validation on new and updated pull requests
+    - event: pull_request
+      filter:
+        action: "opened"
+      workflow: pr-validation
+      workflowNamespace: ci
+      inputs:
+        repository: "{{ .repository.full_name }}"
+        prNumber: "{{ .number }}"
+        headSha: "{{ .pull_request.head.sha }}"
+        baseBranch: "{{ .pull_request.base.ref }}"
+        headBranch: "{{ .pull_request.head.ref }}"
+        author: "{{ .pull_request.user.login }}"
+
+    - event: pull_request
+      filter:
+        action: "synchronize"
+      workflow: pr-validation
+      workflowNamespace: ci
+      inputs:
+        repository: "{{ .repository.full_name }}"
+        prNumber: "{{ .number }}"
+        headSha: "{{ .pull_request.head.sha }}"
+        baseBranch: "{{ .pull_request.base.ref }}"
+        headBranch: "{{ .pull_request.head.ref }}"
+        author: "{{ .pull_request.user.login }}"
+
+    # Trigger security scan on PR reviews
+    - event: pull_request_review
+      filter:
+        action: "submitted"
+      workflow: security-scan
+      workflowNamespace: security
+      inputs:
+        repository: "{{ .repository.full_name }}"
+        prNumber: "{{ .pull_request.number }}"
+        reviewer: "{{ .review.user.login }}"
+        state: "{{ .review.state }}"
+
+    # Trigger deployment on successful check runs
+    - event: check_run
+      filter:
+        action: "completed"
+      workflow: post-check-deploy
+      workflowNamespace: production
+      inputs:
+        repository: "{{ .repository.full_name }}"
+        checkName: "{{ .check_run.name }}"
+        conclusion: "{{ .check_run.conclusion }}"
+        headSha: "{{ .check_run.head_sha }}"
+
+  # Payload validation (optional)
+  validation:
+    required:
+      - repository
+    maxPayloadBytes: 10485760
+
+  # Enable this endpoint
+  enabled: true
