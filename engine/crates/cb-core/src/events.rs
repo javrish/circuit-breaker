@@ -498,6 +498,20 @@ pub struct TokenConsumedPayload {
     pub consumed_by: String,
 }
 
+/// Payload for token.injected event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenInjectedPayload {
+    pub run_ref: RunRef,
+    pub token: TokenData,
+    pub place_id: String,
+    /// Who/what injected the token (e.g., "api", "cli", user ID)
+    pub injected_by: String,
+    /// Reason for injection (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Payload for task.dispatched event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -627,6 +641,7 @@ pub type TransitionRetryingEvent = Event<TransitionRetryingPayload>;
 
 pub type TokenProducedEvent = Event<TokenProducedPayload>;
 pub type TokenConsumedEvent = Event<TokenConsumedPayload>;
+pub type TokenInjectedEvent = Event<TokenInjectedPayload>;
 
 pub type TaskDispatchedEvent = Event<TaskDispatchedPayload>;
 pub type TaskCompletedEvent = Event<TaskCompletedPayload>;

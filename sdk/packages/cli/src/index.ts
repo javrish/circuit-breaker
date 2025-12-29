@@ -21,6 +21,8 @@ import {
   type Workflow,
 } from "@circuit-breaker/core";
 import logs from "./commands/logs";
+import inject from "./commands/inject";
+import describe from "./commands/describe";
 
 const VERSION = "0.1.0";
 
@@ -383,6 +385,23 @@ program
   .option("--tail <lines>", "Number of lines to show", "100")
   .option("--json", "Output as JSON")
   .action(logs);
+
+// Inject command
+program
+  .command("inject <runId> <placeId>")
+  .description("Inject a token into a specific place in a workflow run")
+  .option("-d, --data <json>", "Optional JSON data to attach to the token")
+  .option("-r, --reason <text>", "Reason for injecting the token")
+  .option("-s, --show-schema", "Show the expected token schema for the place")
+  .option("--json", "Output as JSON")
+  .action(inject);
+
+// Describe command
+program
+  .command("describe <runId>")
+  .description("Show workflow structure, places, and token schemas for a run")
+  .option("--json", "Output as JSON")
+  .action(describe);
 
 // Health command
 program

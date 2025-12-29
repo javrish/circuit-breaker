@@ -331,6 +331,12 @@ pub mod subjects {
         format!("{}.runs.{}.marking", PREFIX, run_id)
     }
 
+    /// Subject for token injected events.
+    /// Pattern: `cb.runs.{run_id}.tokens.{place_id}.injected`
+    pub fn token_injected(run_id: &Uuid, place_id: &str) -> String {
+        format!("{}.runs.{}.tokens.{}.injected", PREFIX, run_id, place_id)
+    }
+
     // ==================== Transition Subjects ====================
 
     /// Subject for transition enabled events.

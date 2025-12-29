@@ -26,6 +26,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use jsonschema::JSONSchema;
+
 use futures::StreamExt;
 
 use axum::{
@@ -35,7 +37,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use cb_core::events::{TokenData, TransitionRef};
+use cb_core::events::{RunRef, TokenData, TokenInjectedPayload, TransitionRef};
 use cb_core::workflow::Workflow;
 use cb_nats::{streams, NatsClient, NatsConfig};
 use serde::{Deserialize, Serialize};
@@ -150,6 +152,62 @@ pub struct ErrorInfo {
     pub message: String,
     /// Failed transition.
     pub transition: Option<String>,
+}
+
+/// Request to inject a token into a place.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InjectTokenRequest {
+    /// Place ID to inject token into.
+    pub place_id: String,
+    /// Optional token data (must conform to place's token_schema if defined).
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+    /// Optional reason for injection.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Token schema information for a place.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaceSchemaInfo {
+    /// Place ID.
+    pub place_id: String,
+    /// Token schema (JSON Schema) if defined.
+    pub token_schema: Option<serde_json::Value>,
+    /// Current token count.
+    pub token_count: u32,
+    /// Whether tokens require data.
+    pub requires_data: bool,
+}
+
+/// Response after injecting a token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InjectTokenResponse {
+    /// Run ID.
+    pub run_id: Uuid,
+    /// Place where token was injected.
+    pub place_id: String,
+    /// New token count in that place.
+    pub token_count: u32,
+    /// Transitions that are now enabled.
+    pub enabled_transitions: Vec<String>,
+    /// Token schema for the place (if any).
+    pub token_schema: Option<serde_json::Value>,
+}
+
+/// Response with place schema information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DescribePlacesResponse {
+    /// Run ID.
+    pub run_id: Uuid,
+    /// Workflow name.
+    pub workflow_name: String,
+    /// Information about each place.
+    pub places: Vec<PlaceSchemaInfo>,
 }
 
 /// Task execution log entry.
@@ -886,6 +944,211 @@ pub struct CancelRunRequest {
     pub reason: Option<String>,
 }
 
+/// Inject a token into a specific place in a run.
+/// This can be used to trigger specific transitions for testing.
+async fn inject_token(
+    State(state): State<AppState>,
+    Path(run_id): Path<Uuid>,
+    Json(request): Json<InjectTokenRequest>,
+) -> Result<Json<InjectTokenResponse>, ApiError> {
+    // Get the run and its workflow
+    let (workflow_def, current_marking) = {
+        let runs = state.runs.read().await;
+        let run = runs
+            .get(&run_id)
+            .ok_or_else(|| ApiError::not_found(format!("Run {} not found", run_id)))?;
+
+        if run.status != RunStatus::Running && run.status != RunStatus::Pending {
+            return Err(ApiError::conflict(format!(
+                "Run {} is in terminal state {:?}",
+                run_id, run.status
+            )));
+        }
+
+        let workflows = state.workflows.read().await;
+        let workflow = workflows
+            .get(&run.workflow_id)
+            .ok_or_else(|| ApiError::not_found("Workflow not found"))?;
+
+        (workflow.definition.clone(), run.current_marking.clone())
+    };
+
+    // Find the place and validate it exists
+    let place = workflow_def
+        .places
+        .iter()
+        .find(|p| p.id == request.place_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "Place '{}' not found in workflow",
+                request.place_id
+            ))
+        })?;
+
+    // Validate token data against schema if defined
+    if let Some(ref schema) = place.token_schema {
+        match JSONSchema::compile(schema) {
+            Ok(compiled) => {
+                let data_to_validate = request.data.clone().unwrap_or(serde_json::Value::Null);
+                let validation_result = compiled.validate(&data_to_validate);
+                if let Err(errors) = validation_result {
+                    let error_messages: Vec<String> = errors.map(|e| format!("{}", e)).collect();
+                    return Err(ApiError::bad_request(format!(
+                        "Token data does not match schema for place '{}': {}",
+                        request.place_id,
+                        error_messages.join(", ")
+                    )));
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Invalid token schema in workflow");
+            }
+        }
+    }
+
+    let token_schema = place.token_schema.clone();
+
+    // Publish TokenInjected event to NATS
+    if let Some(ref nats) = state.nats {
+        let token = if let Some(ref data) = request.data {
+            TokenData::with_data(request.place_id.clone(), data.clone())
+        } else {
+            TokenData::new(request.place_id.clone())
+        };
+
+        let payload = TokenInjectedPayload {
+            run_ref: RunRef {
+                run_id,
+                workflow_id: run_id, // Use run_id as workflow_id for now
+                attempt: 1,
+            },
+            token,
+            place_id: request.place_id.clone(),
+            injected_by: "api".to_string(),
+            reason: request.reason.clone(),
+        };
+
+        let subject = cb_nats::subjects::token_injected(&run_id, &request.place_id);
+        if let Err(e) = nats.publish_jetstream(&subject, &payload).await {
+            warn!(error = %e, "Failed to publish TokenInjected event");
+        } else {
+            info!(subject = %subject, "Published TokenInjected event");
+        }
+    }
+
+    // Update marking
+    let new_token_count = {
+        let mut runs = state.runs.write().await;
+        let run = runs.get_mut(&run_id).unwrap();
+        let count = run
+            .current_marking
+            .entry(request.place_id.clone())
+            .or_insert(0);
+        *count += 1;
+        *count
+    };
+
+    // Find newly enabled transitions
+    let mut new_marking = current_marking.clone();
+    *new_marking.entry(request.place_id.clone()).or_insert(0) += 1;
+    let enabled_transitions = find_enabled_transitions(&workflow_def, &new_marking);
+
+    info!(
+        run_id = %run_id,
+        place_id = %request.place_id,
+        token_count = new_token_count,
+        enabled = ?enabled_transitions,
+        "Token injected"
+    );
+
+    // Dispatch tasks for newly enabled transitions
+    if let Some(ref nats) = state.nats {
+        for transition_id in &enabled_transitions {
+            if let Some(transition) = workflow_def
+                .transitions
+                .iter()
+                .find(|t| &t.id == transition_id)
+            {
+                let task_id = Uuid::new_v4();
+                let action_json = serde_json::to_value(&transition.action).unwrap_or_default();
+
+                let resources = transition.resources.as_ref().map(|r| TaskResources {
+                    cpu: r.cpu.clone(),
+                    memory: r.memory.clone(),
+                });
+
+                let task = TaskDispatchMessage {
+                    task_id,
+                    transition_ref: TransitionRef {
+                        transition_id: transition.id.clone(),
+                        run_id,
+                        execution_id: Some(task_id),
+                    },
+                    action: action_json,
+                    resources,
+                    timeout: Some(transition.timeout.clone()),
+                    runner_pool: "default".to_string(),
+                    environment: HashMap::new(),
+                    input_tokens: vec![],
+                };
+
+                let subject = format!("cb.runs.{}.transitions.{}.enabled", run_id, transition.id);
+
+                if let Err(e) = nats.publish_jetstream(&subject, &task).await {
+                    error!(error = %e, "Failed to dispatch task");
+                } else {
+                    info!(task_id = %task_id, transition_id = %transition.id, "Task dispatched");
+                }
+            }
+        }
+    }
+
+    Ok(Json(InjectTokenResponse {
+        run_id,
+        place_id: request.place_id,
+        token_count: new_token_count,
+        enabled_transitions,
+        token_schema,
+    }))
+}
+
+/// Get schema information for all places in a run.
+async fn describe_places(
+    State(state): State<AppState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<DescribePlacesResponse>, ApiError> {
+    let runs = state.runs.read().await;
+    let run = runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::not_found(format!("Run {} not found", run_id)))?;
+
+    let workflows = state.workflows.read().await;
+    let workflow = workflows
+        .get(&run.workflow_id)
+        .ok_or_else(|| ApiError::not_found("Workflow not found"))?;
+
+    let places: Vec<PlaceSchemaInfo> = workflow
+        .definition
+        .places
+        .iter()
+        .map(|p| {
+            let token_count = run.current_marking.get(&p.id).copied().unwrap_or(0);
+            PlaceSchemaInfo {
+                place_id: p.id.clone(),
+                token_schema: p.token_schema.clone(),
+                token_count,
+                requires_data: p.token_schema.is_some(),
+            }
+        })
+        .collect();
+
+    Ok(Json(DescribePlacesResponse {
+        run_id,
+        workflow_name: run.workflow_name.clone(),
+        places,
+    }))
+}
+
 /// Cancel a run.
 async fn cancel_run(
     State(state): State<AppState>,
@@ -1006,7 +1269,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", get(list_runs))
         .route("/{run_id}", get(get_run_status))
         .route("/{run_id}/logs", get(get_run_logs))
-        .route("/{run_id}/cancel", post(cancel_run));
+        .route("/{run_id}/cancel", post(cancel_run))
+        .route("/{run_id}/inject", post(inject_token))
+        .route("/{run_id}/places", get(describe_places));
 
     let api_v1 = Router::new()
         .nest("/workflows", workflow_routes)
