@@ -578,8 +578,11 @@ async fn handle_transition_completed(
                             execution_id: Some(task_id),
                         },
                         action: serde_json::to_value(&t.action).unwrap_or_default(),
-                        resources: None,
-                        timeout: None,
+                        resources: t.resources.as_ref().map(|r| TaskResources {
+                            cpu: r.cpu.clone(),
+                            memory: r.memory.clone(),
+                        }),
+                        timeout: Some(t.timeout.clone()),
                         runner_pool: "default".to_string(),
                         environment: HashMap::new(),
                         input_tokens: vec![],
