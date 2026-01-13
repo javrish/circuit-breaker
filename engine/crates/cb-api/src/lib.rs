@@ -503,8 +503,7 @@ async fn handle_transition_completed(
             }
 
             // Update marking according to Petri net semantics:
-            // 1. Consume tokens from input places (already done when transition fired)
-            // 2. Produce tokens to output places
+            // Produce tokens to output places (consumption happens at dispatch time)
             for arc in &transition.outputs {
                 let count = run.current_marking.entry(arc.place.clone()).or_insert(0);
                 *count += arc.weight;
@@ -549,12 +548,26 @@ async fn handle_transition_completed(
     if !enabled_transitions.is_empty() {
         if let Some(nats) = nats_client {
             for tid in enabled_transitions {
-                // Mark as running before dispatch
-                if let Some(run) = runs.get_mut(&run_id) {
+                // Atomically claim this transition for dispatch (prevents race condition)
+                let should_dispatch = if let Some(run) = runs.get_mut(&run_id) {
                     if let Some(ts) = run.transitions.iter_mut().find(|t| t.transition_id == tid) {
-                        ts.status = "running".to_string();
-                        ts.started_at = Some(now);
+                        if ts.status == "pending" {
+                            ts.status = "running".to_string();
+                            ts.started_at = Some(now);
+                            true
+                        } else {
+                            // Already claimed by another thread
+                            false
+                        }
+                    } else {
+                        false
                     }
+                } else {
+                    false
+                };
+
+                if !should_dispatch {
+                    continue;
                 }
 
                 // Find the transition in the workflow
