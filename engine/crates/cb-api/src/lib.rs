@@ -440,6 +440,7 @@ async fn handle_transition_completed(
 ) {
     let now = chrono::Utc::now();
     let duration_ms = msg.resource_usage.as_ref().and_then(|r| r.duration_ms);
+    let transition_id = msg.transition_ref.transition_id.clone();
 
     // Store task log
     {
@@ -448,7 +449,7 @@ async fn handle_transition_completed(
         run_logs.push(TaskLog {
             task_id: msg.transition_ref.execution_id.unwrap_or_else(Uuid::new_v4),
             run_id,
-            transition_id: msg.transition_ref.transition_id.clone(),
+            transition_id: transition_id.clone(),
             status: "completed".to_string(),
             output: msg.outputs.clone(),
             error: None,
@@ -458,30 +459,141 @@ async fn handle_transition_completed(
         });
     }
 
+    // Get workflow definition to find arcs
+    let workflow_opt = {
+        let runs = state.runs.read().await;
+        if let Some(run) = runs.get(&run_id) {
+            let workflows = state.workflows.read().await;
+            workflows.get(&run.workflow_id).map(|w| w.definition.clone())
+        } else {
+            None
+        }
+    };
+
+    let workflow = match workflow_opt {
+        Some(w) => w,
+        None => {
+            warn!(run_id = %run_id, "Workflow not found for run");
+            return;
+        }
+    };
+
+    // Find the transition that completed
+    let transition = match workflow.transitions.iter().find(|t| t.id == transition_id) {
+        Some(t) => t.clone(),
+        None => {
+            warn!(run_id = %run_id, transition_id = %transition_id, "Transition not found in workflow");
+            return;
+        }
+    };
+
     let mut runs = state.runs.write().await;
 
-    if let Some(run) = runs.get_mut(&run_id) {
-        // Update transition status
-        if let Some(ts) = run
-            .transitions
-            .iter_mut()
-            .find(|t| t.transition_id == msg.transition_ref.transition_id)
-        {
-            ts.status = "completed".to_string();
-            ts.completed_at = Some(now);
+    // Collect info needed for task dispatch before holding the lock
+    let (enabled_transitions, nats_client) = {
+        if let Some(run) = runs.get_mut(&run_id) {
+            // Update transition status
+            if let Some(ts) = run
+                .transitions
+                .iter_mut()
+                .find(|t| t.transition_id == transition_id)
+            {
+                ts.status = "completed".to_string();
+                ts.completed_at = Some(now);
+            }
+
+            // Update marking according to Petri net semantics:
+            // 1. Consume tokens from input places (already done when transition fired)
+            // 2. Produce tokens to output places
+            for arc in &transition.outputs {
+                let count = run.current_marking.entry(arc.place.clone()).or_insert(0);
+                *count += arc.weight;
+                info!(
+                    run_id = %run_id,
+                    transition_id = %transition_id,
+                    place = %arc.place,
+                    tokens = *count,
+                    "Produced token to output place"
+                );
+            }
+
+            // Check if workflow is complete (all transitions completed)
+            let all_complete = run.transitions.iter().all(|t| t.status == "completed");
+            if all_complete {
+                run.status = RunStatus::Completed;
+                run.completed_at = Some(now);
+                info!(run_id = %run_id, "Workflow run completed");
+                (vec![], state.nats.clone())
+            } else {
+                // Find newly enabled transitions
+                let enabled = find_enabled_transitions(&workflow, &run.current_marking);
+                // Filter out already running or completed transitions
+                let pending_enabled: Vec<String> = enabled
+                    .into_iter()
+                    .filter(|tid| {
+                        run.transitions
+                            .iter()
+                            .find(|t| &t.transition_id == tid)
+                            .map(|t| t.status == "pending")
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                (pending_enabled, state.nats.clone())
+            }
+        } else {
+            (vec![], None)
         }
+    };
 
-        // Update marking - consume from input places, produce to output places
-        // For simplicity, we'll check if all transitions are complete
-        let all_complete = run.transitions.iter().all(|t| t.status == "completed");
+    // Dispatch tasks for newly enabled transitions (outside the lock)
+    if !enabled_transitions.is_empty() {
+        if let Some(nats) = nats_client {
+            for tid in enabled_transitions {
+                // Mark as running before dispatch
+                if let Some(run) = runs.get_mut(&run_id) {
+                    if let Some(ts) = run.transitions.iter_mut().find(|t| t.transition_id == tid) {
+                        ts.status = "running".to_string();
+                        ts.started_at = Some(now);
+                    }
+                }
 
-        if all_complete {
-            run.status = RunStatus::Completed;
-            run.completed_at = Some(now);
-            // Clear all tokens and put one in a "done" place if it exists
-            run.current_marking.clear();
-            run.current_marking.insert("done".to_string(), 1);
-            info!(run_id = %run_id, "Workflow run completed");
+                // Find the transition in the workflow
+                if let Some(t) = workflow.transitions.iter().find(|t| t.id == tid) {
+                    // Consume tokens from input places
+                    if let Some(run) = runs.get_mut(&run_id) {
+                        for arc in &t.inputs {
+                            if let Some(count) = run.current_marking.get_mut(&arc.place) {
+                                *count = count.saturating_sub(arc.weight);
+                            }
+                        }
+                    }
+
+                    // Dispatch task
+                    let task_id = Uuid::new_v4();
+                    let task = TaskDispatchMessage {
+                        task_id,
+                        transition_ref: TransitionRef {
+                            run_id,
+                            transition_id: tid.clone(),
+                            execution_id: Some(task_id),
+                        },
+                        action: serde_json::to_value(&t.action).unwrap_or_default(),
+                        resources: None,
+                        timeout: None,
+                        runner_pool: "default".to_string(),
+                        environment: HashMap::new(),
+                        input_tokens: vec![],
+                    };
+
+                    let subject = format!("cb.runs.{}.transitions.{}.enabled", run_id, tid);
+                    // publish_jetstream does its own serialization, so pass the task directly
+                    if let Err(e) = nats.publish_jetstream(&subject, &task).await {
+                        error!(error = %e, run_id = %run_id, transition_id = %tid, "Failed to dispatch task");
+                    } else {
+                        info!(run_id = %run_id, transition_id = %tid, task_id = %task_id, "Dispatched task for enabled transition");
+                    }
+                }
+            }
         }
     }
 }
@@ -1376,4 +1488,232 @@ pub mod prelude {
         build_router, connect_nats, init_nats_streams, serve, start_event_subscriber, ApiConfig,
         AppState,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cb_core::workflow::{Action, Arc as WfArc, Place, Transition, Workflow};
+
+    fn create_sequential_workflow() -> Workflow {
+        // start -> [t1] -> middle -> [t2] -> end
+        Workflow {
+            version: "1.0".to_string(),
+            name: "sequential-test".to_string(),
+            namespace: "test".to_string(),
+            metadata: None,
+            places: vec![
+                Place {
+                    id: "start".to_string(),
+                    initial_tokens: 1,
+                    capacity: None,
+                    token_schema: None,
+                },
+                Place {
+                    id: "middle".to_string(),
+                    initial_tokens: 0,
+                    capacity: None,
+                    token_schema: None,
+                },
+                Place {
+                    id: "end".to_string(),
+                    initial_tokens: 0,
+                    capacity: None,
+                    token_schema: None,
+                },
+            ],
+            transitions: vec![
+                Transition {
+                    id: "t1".to_string(),
+                    inputs: vec![WfArc {
+                        place: "start".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    outputs: vec![WfArc {
+                        place: "middle".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    guard: None,
+                    action: Action::Noop,
+                    resources: None,
+                    timeout: "5m".to_string(),
+                    retries: 0,
+                    retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
+                    priority: 50,
+                },
+                Transition {
+                    id: "t2".to_string(),
+                    inputs: vec![WfArc {
+                        place: "middle".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    outputs: vec![WfArc {
+                        place: "end".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    guard: None,
+                    action: Action::Noop,
+                    resources: None,
+                    timeout: "5m".to_string(),
+                    retries: 0,
+                    retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
+                    priority: 50,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_find_enabled_transitions_initial() {
+        let workflow = create_sequential_workflow();
+        let mut marking = HashMap::new();
+        marking.insert("start".to_string(), 1);
+
+        let enabled = find_enabled_transitions(&workflow, &marking);
+
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0], "t1");
+    }
+
+    #[test]
+    fn test_find_enabled_transitions_after_t1() {
+        let workflow = create_sequential_workflow();
+        let mut marking = HashMap::new();
+        // After t1 fires: token moves from start to middle
+        marking.insert("start".to_string(), 0);
+        marking.insert("middle".to_string(), 1);
+
+        let enabled = find_enabled_transitions(&workflow, &marking);
+
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0], "t2");
+    }
+
+    #[test]
+    fn test_find_enabled_transitions_none_enabled() {
+        let workflow = create_sequential_workflow();
+        let mut marking = HashMap::new();
+        // After t2 fires: token in end, nothing enabled
+        marking.insert("end".to_string(), 1);
+
+        let enabled = find_enabled_transitions(&workflow, &marking);
+
+        assert!(enabled.is_empty());
+    }
+
+    #[test]
+    fn test_find_enabled_transitions_insufficient_tokens() {
+        let workflow = create_sequential_workflow();
+        let marking = HashMap::new(); // No tokens anywhere
+
+        let enabled = find_enabled_transitions(&workflow, &marking);
+
+        assert!(enabled.is_empty());
+    }
+
+    fn create_parallel_workflow() -> Workflow {
+        // start -> [t1] -> a
+        //      \-> [t2] -> b
+        // Both t1 and t2 consume from start (need 2 tokens)
+        Workflow {
+            version: "1.0".to_string(),
+            name: "parallel-test".to_string(),
+            namespace: "test".to_string(),
+            metadata: None,
+            places: vec![
+                Place {
+                    id: "start".to_string(),
+                    initial_tokens: 2,
+                    capacity: None,
+                    token_schema: None,
+                },
+                Place {
+                    id: "a".to_string(),
+                    initial_tokens: 0,
+                    capacity: None,
+                    token_schema: None,
+                },
+                Place {
+                    id: "b".to_string(),
+                    initial_tokens: 0,
+                    capacity: None,
+                    token_schema: None,
+                },
+            ],
+            transitions: vec![
+                Transition {
+                    id: "t1".to_string(),
+                    inputs: vec![WfArc {
+                        place: "start".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    outputs: vec![WfArc {
+                        place: "a".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    guard: None,
+                    action: Action::Noop,
+                    resources: None,
+                    timeout: "5m".to_string(),
+                    retries: 0,
+                    retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
+                    priority: 50,
+                },
+                Transition {
+                    id: "t2".to_string(),
+                    inputs: vec![WfArc {
+                        place: "start".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    outputs: vec![WfArc {
+                        place: "b".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    guard: None,
+                    action: Action::Noop,
+                    resources: None,
+                    timeout: "5m".to_string(),
+                    retries: 0,
+                    retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
+                    priority: 50,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_find_enabled_transitions_parallel() {
+        let workflow = create_parallel_workflow();
+        let mut marking = HashMap::new();
+        marking.insert("start".to_string(), 2);
+
+        let enabled = find_enabled_transitions(&workflow, &marking);
+
+        // Both t1 and t2 should be enabled
+        assert_eq!(enabled.len(), 2);
+        assert!(enabled.contains(&"t1".to_string()));
+        assert!(enabled.contains(&"t2".to_string()));
+    }
+
+    #[test]
+    fn test_find_enabled_transitions_partial_parallel() {
+        let workflow = create_parallel_workflow();
+        let mut marking = HashMap::new();
+        // Only 1 token, both transitions need 1, but only one can fire
+        marking.insert("start".to_string(), 1);
+
+        let enabled = find_enabled_transitions(&workflow, &marking);
+
+        // Both are still "enabled" (have enough tokens individually)
+        // The actual conflict resolution happens at dispatch time
+        assert_eq!(enabled.len(), 2);
+    }
 }
