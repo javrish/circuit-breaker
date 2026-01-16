@@ -696,6 +696,18 @@ fn apply_pipe_ops(mut value: serde_json::Value, ops: &[PipeOp]) -> serde_json::V
 }
 
 /// Apply a single pipe operation to a JSON value.
+///
+/// # Type handling
+///
+/// Pipe operations are designed to be forgiving for webhook processing:
+///
+/// - **String operations** (`trimPrefix`, `trimSuffix`, `toLower`, `toUpper`, `trim`, `replace`):
+///   Only apply to string values. Non-string values pass through unchanged with a warning log.
+///   This is intentional - webhooks should be resilient, and silent pass-through with logging
+///   is preferable to hard failures.
+///
+/// - **Universal operations** (`toJson`, `default`):
+///   Work on any value type. `toJson` serializes any value; `default` handles null/empty.
 fn apply_single_pipe_op(value: serde_json::Value, op: &PipeOp) -> serde_json::Value {
     match op {
         PipeOp::TrimPrefix(prefix) => {
@@ -703,6 +715,11 @@ fn apply_single_pipe_op(value: serde_json::Value, op: &PipeOp) -> serde_json::Va
                 let result = s.strip_prefix(prefix.as_str()).unwrap_or(&s).to_string();
                 serde_json::Value::String(result)
             } else {
+                tracing::warn!(
+                    op = "trimPrefix",
+                    value_type = value_type_name(&value),
+                    "pipe operation requires string input, passing through unchanged"
+                );
                 value
             }
         }
@@ -711,6 +728,11 @@ fn apply_single_pipe_op(value: serde_json::Value, op: &PipeOp) -> serde_json::Va
                 let result = s.strip_suffix(suffix.as_str()).unwrap_or(&s).to_string();
                 serde_json::Value::String(result)
             } else {
+                tracing::warn!(
+                    op = "trimSuffix",
+                    value_type = value_type_name(&value),
+                    "pipe operation requires string input, passing through unchanged"
+                );
                 value
             }
         }
@@ -718,6 +740,11 @@ fn apply_single_pipe_op(value: serde_json::Value, op: &PipeOp) -> serde_json::Va
             if let serde_json::Value::String(s) = value {
                 serde_json::Value::String(s.to_lowercase())
             } else {
+                tracing::warn!(
+                    op = "toLower",
+                    value_type = value_type_name(&value),
+                    "pipe operation requires string input, passing through unchanged"
+                );
                 value
             }
         }
@@ -725,6 +752,11 @@ fn apply_single_pipe_op(value: serde_json::Value, op: &PipeOp) -> serde_json::Va
             if let serde_json::Value::String(s) = value {
                 serde_json::Value::String(s.to_uppercase())
             } else {
+                tracing::warn!(
+                    op = "toUpper",
+                    value_type = value_type_name(&value),
+                    "pipe operation requires string input, passing through unchanged"
+                );
                 value
             }
         }
@@ -732,6 +764,11 @@ fn apply_single_pipe_op(value: serde_json::Value, op: &PipeOp) -> serde_json::Va
             if let serde_json::Value::String(s) = value {
                 serde_json::Value::String(s.trim().to_string())
             } else {
+                tracing::warn!(
+                    op = "trim",
+                    value_type = value_type_name(&value),
+                    "pipe operation requires string input, passing through unchanged"
+                );
                 value
             }
         }
@@ -739,9 +776,15 @@ fn apply_single_pipe_op(value: serde_json::Value, op: &PipeOp) -> serde_json::Va
             if let serde_json::Value::String(s) = value {
                 serde_json::Value::String(s.replace(old, new))
             } else {
+                tracing::warn!(
+                    op = "replace",
+                    value_type = value_type_name(&value),
+                    "pipe operation requires string input, passing through unchanged"
+                );
                 value
             }
         }
+        // Universal operations - work on any value type
         PipeOp::Default(default_value) => {
             match &value {
                 serde_json::Value::Null => serde_json::Value::String(default_value.clone()),
@@ -752,12 +795,24 @@ fn apply_single_pipe_op(value: serde_json::Value, op: &PipeOp) -> serde_json::Va
             }
         }
         PipeOp::ToJson => {
-            // Convert the value to a JSON string representation
+            // Convert the value to a JSON string representation - works on any type
             match serde_json::to_string(&value) {
                 Ok(json_str) => serde_json::Value::String(json_str),
                 Err(_) => value,
             }
         }
+    }
+}
+
+/// Get a human-readable type name for a JSON value (for logging).
+fn value_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -1466,5 +1521,56 @@ mod tests {
             inputs.get("normalized_name"),
             Some(&serde_json::Value::String("test".to_string()))
         );
+    }
+
+    // Test: Non-string values pass through string operations unchanged (no-op + warn behavior)
+    #[test]
+    fn test_pipe_ops_non_string_passthrough() {
+        // String operations on non-string values should pass through unchanged
+        let number = serde_json::json!(42);
+        let array = serde_json::json!([1, 2, 3]);
+        let object = serde_json::json!({"key": "value"});
+
+        // trimPrefix on number - passes through
+        let result = apply_pipe_ops(number.clone(), &[PipeOp::TrimPrefix("pre".to_string())]);
+        assert_eq!(result, number);
+
+        // toLower on array - passes through
+        let result = apply_pipe_ops(array.clone(), &[PipeOp::ToLower]);
+        assert_eq!(result, array);
+
+        // trim on object - passes through
+        let result = apply_pipe_ops(object.clone(), &[PipeOp::Trim]);
+        assert_eq!(result, object);
+
+        // replace on number - passes through
+        let result = apply_pipe_ops(number.clone(), &[PipeOp::Replace {
+            old: "a".to_string(),
+            new: "b".to_string(),
+        }]);
+        assert_eq!(result, number);
+    }
+
+    // Test: Universal operations work on any type
+    #[test]
+    fn test_pipe_ops_universal_operations() {
+        // toJson works on any type
+        let number = serde_json::json!(42);
+        let result = apply_pipe_ops(number, &[PipeOp::ToJson]);
+        assert_eq!(result, serde_json::Value::String("42".to_string()));
+
+        let array = serde_json::json!([1, 2, 3]);
+        let result = apply_pipe_ops(array, &[PipeOp::ToJson]);
+        assert_eq!(result, serde_json::Value::String("[1,2,3]".to_string()));
+
+        // default works on null
+        let null = serde_json::Value::Null;
+        let result = apply_pipe_ops(null, &[PipeOp::Default("fallback".to_string())]);
+        assert_eq!(result, serde_json::Value::String("fallback".to_string()));
+
+        // default passes through non-empty non-null values
+        let number = serde_json::json!(42);
+        let result = apply_pipe_ops(number.clone(), &[PipeOp::Default("fallback".to_string())]);
+        assert_eq!(result, number);
     }
 }
