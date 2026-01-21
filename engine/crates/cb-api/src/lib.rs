@@ -438,50 +438,208 @@ async fn handle_transition_completed(
     run_id: Uuid,
     msg: TransitionCompletedMessage,
 ) {
+    use cb_core::petri::{terminal_places, try_fire_transition, Marking};
+
     let now = chrono::Utc::now();
     let duration_ms = msg.resource_usage.as_ref().and_then(|r| r.duration_ms);
+    let task_id = msg.transition_ref.execution_id.unwrap_or_else(Uuid::new_v4);
+    let started_at = now - chrono::Duration::milliseconds(duration_ms.unwrap_or(0) as i64);
 
-    // Store task log
+    // NOTE: TaskLog is written AFTER we know the Petri firing outcome (success or failure).
+    // This ensures TaskLog status accurately reflects whether the marking was updated.
+
+    // Get workflow_id from the run first (need read lock)
+    let workflow_id = {
+        let runs = state.runs.read().await;
+        match runs.get(&run_id) {
+            Some(run) => run.workflow_id,
+            None => {
+                warn!(run_id = %run_id, "Run not found for transition completion");
+                return;
+            }
+        }
+    };
+
+    // Look up the workflow definition to get transition arcs
+    let workflow_def = {
+        let workflows = state.workflows.read().await;
+        match workflows.get(&workflow_id) {
+            Some(stored) => stored.definition.clone(),
+            None => {
+                error!(
+                    workflow_id = %workflow_id,
+                    run_id = %run_id,
+                    "Workflow not found for transition completion"
+                );
+                return;
+            }
+        }
+    };
+
+    // Find the transition that completed
+    let transition = match workflow_def
+        .transitions
+        .iter()
+        .find(|t| t.id == msg.transition_ref.transition_id)
     {
-        let mut logs = state.task_logs.write().await;
-        let run_logs = logs.entry(run_id).or_insert_with(Vec::new);
-        run_logs.push(TaskLog {
-            task_id: msg.transition_ref.execution_id.unwrap_or_else(Uuid::new_v4),
-            run_id,
-            transition_id: msg.transition_ref.transition_id.clone(),
-            status: "completed".to_string(),
-            output: msg.outputs.clone(),
-            error: None,
-            started_at: now - chrono::Duration::milliseconds(duration_ms.unwrap_or(0) as i64),
-            completed_at: Some(now),
-            duration_ms,
-        });
+        Some(t) => t,
+        None => {
+            error!(
+                transition_id = %msg.transition_ref.transition_id,
+                run_id = %run_id,
+                "Transition not found in workflow definition"
+            );
+            return;
+        }
+    };
+
+    // Track result for TaskLog writing after releasing the runs lock
+    enum FiringOutcome {
+        Success,
+        Failure { error_msg: String },
     }
 
-    let mut runs = state.runs.write().await;
+    let firing_outcome: Option<FiringOutcome>;
+    let transition_id_for_log = transition.id.clone();
 
-    if let Some(run) = runs.get_mut(&run_id) {
-        // Update transition status
-        if let Some(ts) = run
-            .transitions
-            .iter_mut()
-            .find(|t| t.transition_id == msg.transition_ref.transition_id)
-        {
-            ts.status = "completed".to_string();
-            ts.completed_at = Some(now);
+    {
+        let mut runs = state.runs.write().await;
+
+        if let Some(run) = runs.get_mut(&run_id) {
+            // Update transition status (will be corrected to "failed" if firing fails)
+            if let Some(ts) = run
+                .transitions
+                .iter_mut()
+                .find(|t| t.transition_id == msg.transition_ref.transition_id)
+            {
+                ts.status = "completed".to_string();
+                ts.completed_at = Some(now);
+            }
+
+            // Apply Petri net firing semantics using cb-core::petri::try_fire_transition.
+            // This ensures we use the canonical firing logic from the core library.
+            //
+            // Note: Input tokens were consumed when the transition was fired (dispatched).
+            // Here we produce output tokens as the transition completes. For correctness,
+            // we should track "in-flight" tokens separately, but for now we apply the full
+            // firing rule here since the current implementation doesn't consume on dispatch.
+
+            // Convert current marking to Petri Marking type
+            let mut marking = Marking::from_counts(&run.current_marking);
+
+            // Fire the transition using core Petri semantics
+            match try_fire_transition(transition, &mut marking, &workflow_def) {
+                Ok(result) => {
+                    // Convert the new marking back to HashMap<String, u32>
+                    run.current_marking = result
+                        .new_marking
+                        .as_counts()
+                        .into_iter()
+                        .filter(|(_, count)| *count > 0)
+                        .map(|(k, v)| (k, v as u32))
+                        .collect();
+
+                    // Check if workflow is complete: no enabled transitions and tokens only in terminal places
+                    let enabled = find_enabled_transitions(&workflow_def, &run.current_marking);
+                    let terminal = terminal_places(&workflow_def);
+
+                    let all_tokens_in_terminal = run.current_marking.iter().all(|(place, count)| {
+                        *count == 0 || terminal.contains(&place.as_str())
+                    });
+
+                    if enabled.is_empty() && all_tokens_in_terminal && !run.current_marking.is_empty()
+                    {
+                        run.status = RunStatus::Completed;
+                        run.completed_at = Some(now);
+                        info!(
+                            run_id = %run_id,
+                            final_marking = ?run.current_marking,
+                            "Workflow run completed"
+                        );
+                    }
+
+                    firing_outcome = Some(FiringOutcome::Success);
+                }
+                Err(e) => {
+                    // Insufficient tokens indicates a system inconsistency.
+                    // Mark the run as failed with a concrete reason.
+                    let error_msg = format!(
+                        "Transition '{}' cannot fire: place '{}' has {} tokens but {} required",
+                        e.transition_id, e.place_id, e.available, e.required
+                    );
+
+                    error!(
+                        run_id = %run_id,
+                        transition_id = %transition.id,
+                        error = %error_msg,
+                        "Failed to fire transition: insufficient tokens - marking run as failed"
+                    );
+
+                    // Update transition status to failed
+                    if let Some(ts) = run
+                        .transitions
+                        .iter_mut()
+                        .find(|t| t.transition_id == transition.id)
+                    {
+                        ts.status = "failed".to_string();
+                        ts.completed_at = Some(now);
+                        ts.error = Some(format!("Petri net invariant violated: {}", e));
+                    }
+
+                    // Mark run as failed
+                    run.status = RunStatus::Failed;
+                    run.completed_at = Some(now);
+                    run.error = Some(ErrorInfo {
+                        code: "PETRI_NET_INVARIANT_VIOLATION".to_string(),
+                        message: error_msg.clone(),
+                        transition: Some(transition.id.clone()),
+                    });
+
+                    firing_outcome = Some(FiringOutcome::Failure { error_msg });
+                }
+            }
+        } else {
+            firing_outcome = None;
         }
+    } // runs lock released here
 
-        // Update marking - consume from input places, produce to output places
-        // For simplicity, we'll check if all transitions are complete
-        let all_complete = run.transitions.iter().all(|t| t.status == "completed");
-
-        if all_complete {
-            run.status = RunStatus::Completed;
-            run.completed_at = Some(now);
-            // Clear all tokens and put one in a "done" place if it exists
-            run.current_marking.clear();
-            run.current_marking.insert("done".to_string(), 1);
-            info!(run_id = %run_id, "Workflow run completed");
+    // Write TaskLog AFTER Petri firing outcome is known (and runs lock is released).
+    // IMPORTANT: TaskLog "completed" means the Petri firing was successfully applied to state.
+    // We only write it after try_fire_transition() succeeds. Do NOT move this earlier.
+    match firing_outcome {
+        Some(FiringOutcome::Success) => {
+            let mut logs = state.task_logs.write().await;
+            let run_logs = logs.entry(run_id).or_insert_with(Vec::new);
+            run_logs.push(TaskLog {
+                task_id,
+                run_id,
+                transition_id: transition_id_for_log,
+                status: "completed".to_string(),
+                output: msg.outputs.clone(),
+                error: None,
+                started_at,
+                completed_at: Some(now),
+                duration_ms,
+            });
+        }
+        Some(FiringOutcome::Failure { error_msg }) => {
+            let mut logs = state.task_logs.write().await;
+            let run_logs = logs.entry(run_id).or_insert_with(Vec::new);
+            run_logs.push(TaskLog {
+                task_id,
+                run_id,
+                transition_id: transition_id_for_log,
+                status: "failed".to_string(),
+                output: None,
+                error: Some(error_msg),
+                started_at,
+                completed_at: Some(now),
+                duration_ms,
+            });
+            info!(run_id = %run_id, "Workflow run failed due to Petri net invariant violation");
+        }
+        None => {
+            // Run not found, no TaskLog to write
         }
     }
 }
@@ -1376,4 +1534,678 @@ pub mod prelude {
         build_router, connect_nats, init_nats_streams, serve, start_event_subscriber, ApiConfig,
         AppState,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cb_core::events::TransitionRef;
+    use cb_core::petri::terminal_places;
+    use cb_core::workflow::{Action, Arc, Place, Transition, Workflow};
+
+    /// Helper to create a test AppState with a workflow and run.
+    async fn setup_test_state(
+        workflow: Workflow,
+        initial_marking: HashMap<String, u32>,
+    ) -> (AppState, Uuid, Uuid) {
+        let state = AppState::default();
+        let workflow_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
+        // Store workflow
+        {
+            let mut workflows = state.workflows.write().await;
+            workflows.insert(
+                workflow_id,
+                StoredWorkflow {
+                    workflow_id,
+                    name: workflow.name.clone(),
+                    namespace: workflow.namespace.clone(),
+                    definition: workflow.clone(),
+                    created_at: now,
+                },
+            );
+        }
+
+        // Create run with initial marking
+        let transitions: Vec<TransitionStatus> = workflow
+            .transitions
+            .iter()
+            .map(|t| TransitionStatus {
+                transition_id: t.id.clone(),
+                status: "pending".to_string(),
+                attempt: 0,
+                started_at: None,
+                completed_at: None,
+                error: None,
+            })
+            .collect();
+
+        let run = WorkflowRun {
+            run_id,
+            workflow_id,
+            workflow_name: workflow.name.clone(),
+            status: RunStatus::Running,
+            started_at: now,
+            completed_at: None,
+            current_marking: initial_marking,
+            transitions,
+            error: None,
+        };
+
+        {
+            let mut runs = state.runs.write().await;
+            runs.insert(run_id, run);
+        }
+
+        (state, workflow_id, run_id)
+    }
+
+    fn create_simple_workflow() -> Workflow {
+        // Simple: start -> t1 -> end
+        Workflow {
+            version: "1.0".to_string(),
+            name: "simple-test".to_string(),
+            namespace: "default".to_string(),
+            metadata: None,
+            places: vec![
+                Place {
+                    id: "start".to_string(),
+                    initial_tokens: 1,
+                    capacity: None,
+                    token_schema: None,
+                },
+                Place {
+                    id: "end".to_string(),
+                    initial_tokens: 0,
+                    capacity: None,
+                    token_schema: None,
+                },
+            ],
+            transitions: vec![Transition {
+                id: "t1".to_string(),
+                inputs: vec![Arc {
+                    place: "start".to_string(),
+                    weight: 1,
+                    expression: None,
+                }],
+                outputs: vec![Arc {
+                    place: "end".to_string(),
+                    weight: 1,
+                    expression: None,
+                }],
+                guard: None,
+                action: Action::Noop,
+                resources: None,
+                timeout: "5m".to_string(),
+                retries: 0,
+                retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
+                priority: 50,
+            }],
+        }
+    }
+
+    /// Creates a parallel (fork-join) workflow:
+    ///
+    ///          ┌─── t1 ───┐
+    ///   start ─┤          ├─ join ─ t3 ─ end
+    ///          └─── t2 ───┘
+    ///
+    /// t1 and t2 can fire in parallel, t3 requires both to complete.
+    fn create_parallel_workflow() -> Workflow {
+        Workflow {
+            version: "1.0".to_string(),
+            name: "parallel-test".to_string(),
+            namespace: "default".to_string(),
+            metadata: None,
+            places: vec![
+                Place {
+                    id: "start".to_string(),
+                    initial_tokens: 2, // Two tokens for parallel paths
+                    capacity: None,
+                    token_schema: None,
+                },
+                Place {
+                    id: "after-t1".to_string(),
+                    initial_tokens: 0,
+                    capacity: None,
+                    token_schema: None,
+                },
+                Place {
+                    id: "after-t2".to_string(),
+                    initial_tokens: 0,
+                    capacity: None,
+                    token_schema: None,
+                },
+                Place {
+                    id: "end".to_string(),
+                    initial_tokens: 0,
+                    capacity: None,
+                    token_schema: None,
+                },
+            ],
+            transitions: vec![
+                Transition {
+                    id: "t1".to_string(),
+                    inputs: vec![Arc {
+                        place: "start".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    outputs: vec![Arc {
+                        place: "after-t1".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    guard: None,
+                    action: Action::Noop,
+                    resources: None,
+                    timeout: "5m".to_string(),
+                    retries: 0,
+                    retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
+                    priority: 50,
+                },
+                Transition {
+                    id: "t2".to_string(),
+                    inputs: vec![Arc {
+                        place: "start".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    outputs: vec![Arc {
+                        place: "after-t2".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    guard: None,
+                    action: Action::Noop,
+                    resources: None,
+                    timeout: "5m".to_string(),
+                    retries: 0,
+                    retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
+                    priority: 50,
+                },
+                Transition {
+                    id: "t3".to_string(),
+                    inputs: vec![
+                        Arc {
+                            place: "after-t1".to_string(),
+                            weight: 1,
+                            expression: None,
+                        },
+                        Arc {
+                            place: "after-t2".to_string(),
+                            weight: 1,
+                            expression: None,
+                        },
+                    ],
+                    outputs: vec![Arc {
+                        place: "end".to_string(),
+                        weight: 1,
+                        expression: None,
+                    }],
+                    guard: None,
+                    action: Action::Noop,
+                    resources: None,
+                    timeout: "5m".to_string(),
+                    retries: 0,
+                    retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
+                    priority: 50,
+                },
+            ],
+        }
+    }
+
+    /// Creates a workflow with a non-"done" terminal place.
+    fn create_custom_terminal_workflow() -> Workflow {
+        Workflow {
+            version: "1.0".to_string(),
+            name: "custom-terminal-test".to_string(),
+            namespace: "default".to_string(),
+            metadata: None,
+            places: vec![
+                Place {
+                    id: "start".to_string(),
+                    initial_tokens: 1,
+                    capacity: None,
+                    token_schema: None,
+                },
+                Place {
+                    id: "completed-successfully".to_string(), // NOT "done"
+                    initial_tokens: 0,
+                    capacity: None,
+                    token_schema: None,
+                },
+            ],
+            transitions: vec![Transition {
+                id: "process".to_string(),
+                inputs: vec![Arc {
+                    place: "start".to_string(),
+                    weight: 1,
+                    expression: None,
+                }],
+                outputs: vec![Arc {
+                    place: "completed-successfully".to_string(),
+                    weight: 1,
+                    expression: None,
+                }],
+                guard: None,
+                action: Action::Noop,
+                resources: None,
+                timeout: "5m".to_string(),
+                retries: 0,
+                retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
+                priority: 50,
+            }],
+        }
+    }
+
+    // ==================== Regression Tests ====================
+
+    /// Test: Simple workflow marking update.
+    /// Before fix: Marking would incorrectly become {done: 1}.
+    /// After fix: Marking correctly becomes {end: 1}.
+    #[tokio::test]
+    async fn test_simple_marking_update() {
+        let workflow = create_simple_workflow();
+        let initial_marking = [("start".to_string(), 1u32)].into_iter().collect();
+        let (state, _workflow_id, run_id) = setup_test_state(workflow, initial_marking).await;
+
+        // Simulate t1 completing
+        let msg = TransitionCompletedMessage {
+            transition_ref: TransitionRef {
+                transition_id: "t1".to_string(),
+                run_id,
+                execution_id: Some(Uuid::new_v4()),
+            },
+            produced_tokens: vec![],
+            outputs: None,
+            resource_usage: None,
+        };
+
+        handle_transition_completed(&state, run_id, msg).await;
+
+        // Verify marking
+        let runs = state.runs.read().await;
+        let run = runs.get(&run_id).expect("run should exist");
+
+        // After t1: start should have 0 tokens, end should have 1
+        assert_eq!(
+            run.current_marking.get("start").copied().unwrap_or(0),
+            0,
+            "start place should have 0 tokens after t1 completes"
+        );
+        assert_eq!(
+            run.current_marking.get("end").copied().unwrap_or(0),
+            1,
+            "end place should have 1 token after t1 completes"
+        );
+
+        // Workflow should be completed (token in terminal place, no enabled transitions)
+        assert_eq!(
+            run.status,
+            RunStatus::Completed,
+            "workflow should be completed"
+        );
+    }
+
+    /// Test: Parallel workflow with fork-join pattern.
+    /// This is the key regression test - the old code would fail here because
+    /// it hardcoded {done: 1} after all transitions complete, ignoring
+    /// intermediate states and the actual Petri net structure.
+    #[tokio::test]
+    async fn test_parallel_marking_update() {
+        let workflow = create_parallel_workflow();
+        let initial_marking = [("start".to_string(), 2u32)].into_iter().collect();
+        let (state, _workflow_id, run_id) = setup_test_state(workflow, initial_marking).await;
+
+        // Step 1: t1 completes (parallel branch 1)
+        let msg1 = TransitionCompletedMessage {
+            transition_ref: TransitionRef {
+                transition_id: "t1".to_string(),
+                run_id,
+                execution_id: Some(Uuid::new_v4()),
+            },
+            produced_tokens: vec![],
+            outputs: None,
+            resource_usage: None,
+        };
+
+        handle_transition_completed(&state, run_id, msg1).await;
+
+        // Verify intermediate marking after t1
+        {
+            let runs = state.runs.read().await;
+            let run = runs.get(&run_id).expect("run should exist");
+
+            assert_eq!(
+                run.current_marking.get("start").copied().unwrap_or(0),
+                1,
+                "start should have 1 token (one consumed by t1)"
+            );
+            assert_eq!(
+                run.current_marking.get("after-t1").copied().unwrap_or(0),
+                1,
+                "after-t1 should have 1 token"
+            );
+            assert_eq!(
+                run.current_marking.get("after-t2").copied().unwrap_or(0),
+                0,
+                "after-t2 should have 0 tokens (t2 not fired)"
+            );
+            assert_eq!(
+                run.status,
+                RunStatus::Running,
+                "workflow should still be running"
+            );
+        }
+
+        // Step 2: t2 completes (parallel branch 2)
+        let msg2 = TransitionCompletedMessage {
+            transition_ref: TransitionRef {
+                transition_id: "t2".to_string(),
+                run_id,
+                execution_id: Some(Uuid::new_v4()),
+            },
+            produced_tokens: vec![],
+            outputs: None,
+            resource_usage: None,
+        };
+
+        handle_transition_completed(&state, run_id, msg2).await;
+
+        // Verify marking after both parallel branches complete
+        {
+            let runs = state.runs.read().await;
+            let run = runs.get(&run_id).expect("run should exist");
+
+            assert_eq!(
+                run.current_marking.get("start").copied().unwrap_or(0),
+                0,
+                "start should have 0 tokens"
+            );
+            assert_eq!(
+                run.current_marking.get("after-t1").copied().unwrap_or(0),
+                1,
+                "after-t1 should have 1 token"
+            );
+            assert_eq!(
+                run.current_marking.get("after-t2").copied().unwrap_or(0),
+                1,
+                "after-t2 should have 1 token"
+            );
+            // t3 is now enabled (has tokens in both inputs)
+            // but workflow is not complete yet
+            assert_eq!(
+                run.status,
+                RunStatus::Running,
+                "workflow should still be running (t3 not fired)"
+            );
+        }
+
+        // Step 3: t3 completes (join)
+        let msg3 = TransitionCompletedMessage {
+            transition_ref: TransitionRef {
+                transition_id: "t3".to_string(),
+                run_id,
+                execution_id: Some(Uuid::new_v4()),
+            },
+            produced_tokens: vec![],
+            outputs: None,
+            resource_usage: None,
+        };
+
+        handle_transition_completed(&state, run_id, msg3).await;
+
+        // Verify final marking
+        {
+            let runs = state.runs.read().await;
+            let run = runs.get(&run_id).expect("run should exist");
+
+            assert_eq!(
+                run.current_marking.get("after-t1").copied().unwrap_or(0),
+                0,
+                "after-t1 should have 0 tokens (consumed by t3)"
+            );
+            assert_eq!(
+                run.current_marking.get("after-t2").copied().unwrap_or(0),
+                0,
+                "after-t2 should have 0 tokens (consumed by t3)"
+            );
+            assert_eq!(
+                run.current_marking.get("end").copied().unwrap_or(0),
+                1,
+                "end should have 1 token"
+            );
+            assert_eq!(
+                run.status,
+                RunStatus::Completed,
+                "workflow should be completed"
+            );
+        }
+    }
+
+    /// Test: Workflow with non-"done" terminal place.
+    /// Before fix: Would incorrectly set marking to {done: 1}.
+    /// After fix: Marking correctly reflects actual terminal place.
+    #[tokio::test]
+    async fn test_custom_terminal_place_marking() {
+        let workflow = create_custom_terminal_workflow();
+        let initial_marking = [("start".to_string(), 1u32)].into_iter().collect();
+        let (state, _workflow_id, run_id) = setup_test_state(workflow, initial_marking).await;
+
+        // Simulate "process" transition completing
+        let msg = TransitionCompletedMessage {
+            transition_ref: TransitionRef {
+                transition_id: "process".to_string(),
+                run_id,
+                execution_id: Some(Uuid::new_v4()),
+            },
+            produced_tokens: vec![],
+            outputs: None,
+            resource_usage: None,
+        };
+
+        handle_transition_completed(&state, run_id, msg).await;
+
+        // Verify marking
+        let runs = state.runs.read().await;
+        let run = runs.get(&run_id).expect("run should exist");
+
+        // Terminal place is "completed-successfully", NOT "done"
+        assert!(
+            !run.current_marking.contains_key("done"),
+            "marking should NOT contain 'done' - that was the old buggy behavior"
+        );
+        assert_eq!(
+            run.current_marking
+                .get("completed-successfully")
+                .copied()
+                .unwrap_or(0),
+            1,
+            "completed-successfully should have 1 token"
+        );
+        assert_eq!(
+            run.status,
+            RunStatus::Completed,
+            "workflow should be completed"
+        );
+    }
+
+    /// Test: terminal_places function correctly identifies terminal places.
+    #[test]
+    fn test_terminal_places_identification() {
+        let workflow = create_parallel_workflow();
+        let terminals = terminal_places(&workflow);
+
+        assert!(
+            terminals.contains(&"end"),
+            "end should be a terminal place"
+        );
+        assert!(
+            !terminals.contains(&"start"),
+            "start should NOT be a terminal place"
+        );
+        assert!(
+            !terminals.contains(&"after-t1"),
+            "after-t1 should NOT be a terminal place"
+        );
+        assert!(
+            !terminals.contains(&"after-t2"),
+            "after-t2 should NOT be a terminal place"
+        );
+    }
+
+    /// Test: find_enabled_transitions works correctly with marking.
+    #[test]
+    fn test_find_enabled_transitions() {
+        let workflow = create_parallel_workflow();
+
+        // Initial marking: 2 tokens in start
+        let marking1: HashMap<String, u32> = [("start".to_string(), 2)].into_iter().collect();
+        let enabled1 = find_enabled_transitions(&workflow, &marking1);
+        assert!(enabled1.contains(&"t1".to_string()), "t1 should be enabled");
+        assert!(enabled1.contains(&"t2".to_string()), "t2 should be enabled");
+        assert!(
+            !enabled1.contains(&"t3".to_string()),
+            "t3 should NOT be enabled"
+        );
+
+        // After t1 and t2: tokens in after-t1 and after-t2
+        let marking2: HashMap<String, u32> = [
+            ("after-t1".to_string(), 1),
+            ("after-t2".to_string(), 1),
+        ]
+        .into_iter()
+        .collect();
+        let enabled2 = find_enabled_transitions(&workflow, &marking2);
+        assert!(
+            !enabled2.contains(&"t1".to_string()),
+            "t1 should NOT be enabled"
+        );
+        assert!(
+            !enabled2.contains(&"t2".to_string()),
+            "t2 should NOT be enabled"
+        );
+        assert!(enabled2.contains(&"t3".to_string()), "t3 should be enabled");
+    }
+
+    /// Test: Petri net invariant violation results in Failed run and "failed" TaskLog.
+    /// This tests the error path when try_fire_transition fails due to insufficient tokens.
+    /// Before fix: TaskLog would say "completed" even though firing failed.
+    /// After fix: TaskLog correctly shows "failed" with error message.
+    #[tokio::test]
+    async fn test_insufficient_tokens_produces_failed_tasklog() {
+        let workflow = create_simple_workflow();
+        // Set up with NO tokens in start - this will cause firing to fail
+        let initial_marking: HashMap<String, u32> = HashMap::new(); // Empty marking!
+        let (state, _workflow_id, run_id) = setup_test_state(workflow, initial_marking).await;
+
+        // Try to complete t1 even though there are no tokens in its input place
+        let msg = TransitionCompletedMessage {
+            transition_ref: TransitionRef {
+                transition_id: "t1".to_string(),
+                run_id,
+                execution_id: Some(Uuid::new_v4()),
+            },
+            produced_tokens: vec![],
+            outputs: None,
+            resource_usage: None,
+        };
+
+        handle_transition_completed(&state, run_id, msg).await;
+
+        // Verify run is marked as Failed
+        {
+            let runs = state.runs.read().await;
+            let run = runs.get(&run_id).expect("run should exist");
+
+            assert_eq!(
+                run.status,
+                RunStatus::Failed,
+                "run should be Failed due to Petri net invariant violation"
+            );
+            assert!(run.error.is_some(), "run should have error info");
+            let error = run.error.as_ref().unwrap();
+            assert_eq!(
+                error.code, "PETRI_NET_INVARIANT_VIOLATION",
+                "error code should indicate Petri net invariant violation"
+            );
+            assert!(
+                error.message.contains("insufficient") || error.message.contains("tokens"),
+                "error message should mention tokens: {}",
+                error.message
+            );
+            assert_eq!(
+                error.transition,
+                Some("t1".to_string()),
+                "error should reference the failing transition"
+            );
+        }
+
+        // Verify TaskLog has "failed" status (NOT "completed")
+        {
+            let logs = state.task_logs.read().await;
+            let run_logs = logs.get(&run_id).expect("should have task logs for run");
+
+            assert_eq!(run_logs.len(), 1, "should have exactly one TaskLog entry");
+
+            let log = &run_logs[0];
+            assert_eq!(
+                log.status, "failed",
+                "TaskLog status should be 'failed', not 'completed'"
+            );
+            assert_eq!(log.transition_id, "t1", "TaskLog should be for transition t1");
+            assert!(
+                log.error.is_some(),
+                "TaskLog should have error message on failure"
+            );
+            let error_msg = log.error.as_ref().unwrap();
+            assert!(
+                error_msg.contains("start") && error_msg.contains("0 tokens"),
+                "error should mention the place with insufficient tokens: {}",
+                error_msg
+            );
+        }
+    }
+
+    /// Test: Successful transition completion produces "completed" TaskLog.
+    /// Ensures TaskLog is written AFTER Petri firing succeeds (not before).
+    #[tokio::test]
+    async fn test_successful_completion_produces_completed_tasklog() {
+        let workflow = create_simple_workflow();
+        let initial_marking = [("start".to_string(), 1u32)].into_iter().collect();
+        let (state, _workflow_id, run_id) = setup_test_state(workflow, initial_marking).await;
+
+        let msg = TransitionCompletedMessage {
+            transition_ref: TransitionRef {
+                transition_id: "t1".to_string(),
+                run_id,
+                execution_id: Some(Uuid::new_v4()),
+            },
+            produced_tokens: vec![],
+            outputs: Some(serde_json::json!({"result": "success"})),
+            resource_usage: None,
+        };
+
+        handle_transition_completed(&state, run_id, msg).await;
+
+        // Verify TaskLog has "completed" status
+        {
+            let logs = state.task_logs.read().await;
+            let run_logs = logs.get(&run_id).expect("should have task logs for run");
+
+            assert_eq!(run_logs.len(), 1, "should have exactly one TaskLog entry");
+
+            let log = &run_logs[0];
+            assert_eq!(
+                log.status, "completed",
+                "TaskLog status should be 'completed'"
+            );
+            assert_eq!(log.transition_id, "t1", "TaskLog should be for transition t1");
+            assert!(log.error.is_none(), "TaskLog should have no error on success");
+            assert!(log.output.is_some(), "TaskLog should preserve outputs");
+        }
+    }
 }
