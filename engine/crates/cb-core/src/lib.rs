@@ -17,16 +17,21 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod engine;
 pub mod error;
 pub mod events;
 pub mod petri;
 pub mod workflow;
 
 // Re-exports for convenience
+pub use engine::{
+    AutoModeConfig, CloudEngineConfig, ContainerRuntime, EngineConfig, EngineMode,
+    EngineRequirements, LocalEngineConfig,
+};
 pub use error::{Error, Result};
 pub use events::{Event, EventMetadata, EventType};
 pub use petri::{Arc, Marking, Place, Token, Transition};
-pub use workflow::{Action, DaggerAction, Resources, Workflow};
+pub use workflow::{Action, DaggerAction, PolicyGate, Resources, Workflow};
 
 /// Schema version for workflow definitions.
 pub const SCHEMA_VERSION: &str = "1.0";
@@ -36,6 +41,7 @@ pub const DEFAULT_NAMESPACE: &str = "default";
 
 /// Prelude module for convenient imports.
 pub mod prelude {
+    pub use crate::engine::{EngineConfig, EngineMode, EngineRequirements};
     pub use crate::error::{Error, Result};
     pub use crate::events::{Event, EventMetadata, EventType};
     pub use crate::petri::{Arc, Marking, Place, Token, Transition};

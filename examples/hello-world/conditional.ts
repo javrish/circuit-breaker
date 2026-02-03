@@ -26,77 +26,83 @@
  *   •            = Initial token
  */
 
-import { workflow } from '@circuit-breaker/core';
+import { workflow } from "@circuit-breaker/core";
 
-const conditionalWorkflow = workflow('conditional-example')
-  .namespace('examples')
-  .description('Demonstrates conditional branching with guard expressions')
+const conditionalWorkflow = workflow("conditional-example")
+  .namespace("examples")
+  .description("Demonstrates conditional branching with guard expressions")
   .labels({
-    example: 'true',
-    complexity: 'intermediate',
-    pattern: 'xor-split',
+    example: "true",
+    complexity: "intermediate",
+    pattern: "xor-split",
   })
 
   // ============ Places (States) ============
 
   // Starting state
-  .place('start', { initialTokens: 1 })
+  .place("start", { initialTokens: 1 })
 
   // After evaluation - waiting for branching decision
-  .place('evaluated')
+  .place("evaluated")
 
   // Terminal states (mutually exclusive outcomes)
-  .place('passed')
-  .place('failed')
+  .place("passed")
+  .place("failed")
 
   // ============ Transitions (Actions) ============
 
   // Evaluate: compute a score that will determine the branch
-  .transition('evaluate')
-    .from('start')
-    .to('evaluated')
-    .script(`
+  .transition("evaluate")
+  .from("start")
+  .to("evaluated")
+  .script(
+    `
       // Simulate evaluating something (e.g., test results, health check)
       const score = Math.floor(Math.random() * 100);
-      console.log('Evaluation score:', score);
+      publish('Evaluation score: ' + score);
 
       // Return the score - this will be available in guard expressions
       return { score };
-    `)
-    .timeout('30s')
-    .done()
+    `,
+  )
+  .timeout("30s")
+  .done()
 
   // Pass branch: fires only if score >= 70
-  .transition('pass')
-    .from('evaluated')
-    .to('passed')
-    .guard('ctx.score >= 70')
-    .script(`
-      console.log('✓ Passed! Score:', ctx.score);
+  .transition("pass")
+  .from("evaluated")
+  .to("passed")
+  .guard("ctx.score >= 70")
+  .script(
+    `
+      publish('✓ Passed! Score: ' + ctx.score);
       return {
         result: 'passed',
         score: ctx.score,
         message: 'Congratulations! You passed.'
       };
-    `)
-    .timeout('30s')
-    .done()
+    `,
+  )
+  .timeout("30s")
+  .done()
 
   // Fail branch: fires only if score < 70
-  .transition('fail')
-    .from('evaluated')
-    .to('failed')
-    .guard('ctx.score < 70')
-    .script(`
-      console.log('✗ Failed. Score:', ctx.score);
+  .transition("fail")
+  .from("evaluated")
+  .to("failed")
+  .guard("ctx.score < 70")
+  .script(
+    `
+      publish('✗ Failed. Score: ' + ctx.score, 'warn');
       return {
         result: 'failed',
         score: ctx.score,
         message: 'Sorry, you did not pass. Try again!'
       };
-    `)
-    .timeout('30s')
-    .done()
+    `,
+  )
+  .timeout("30s")
+  .done()
 
   .build();
 

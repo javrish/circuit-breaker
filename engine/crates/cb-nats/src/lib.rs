@@ -337,6 +337,24 @@ pub mod subjects {
         format!("{}.runs.{}.tokens.{}.injected", PREFIX, run_id, place_id)
     }
 
+    /// Subject for token produced events.
+    /// Pattern: `cb.runs.{run_id}.tokens.{place_id}.produced`
+    pub fn token_produced(run_id: &Uuid, place_id: &str) -> String {
+        format!("{}.runs.{}.tokens.{}.produced", PREFIX, run_id, place_id)
+    }
+
+    /// Subject for token consumed events.
+    /// Pattern: `cb.runs.{run_id}.tokens.{place_id}.consumed`
+    pub fn token_consumed(run_id: &Uuid, place_id: &str) -> String {
+        format!("{}.runs.{}.tokens.{}.consumed", PREFIX, run_id, place_id)
+    }
+
+    /// Subject for token updated events (gate pattern).
+    /// Pattern: `cb.runs.{run_id}.tokens.{place_id}.updated`
+    pub fn token_updated(run_id: &Uuid, place_id: &str) -> String {
+        format!("{}.runs.{}.tokens.{}.updated", PREFIX, run_id, place_id)
+    }
+
     // ==================== Transition Subjects ====================
 
     /// Subject for transition enabled events.

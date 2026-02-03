@@ -431,6 +431,7 @@ mod tests {
                 }],
                 guard: None,
                 action: Action::Noop,
+                policy: None,
                 resources: None,
                 timeout: "5m".to_string(),
                 retries: 0,

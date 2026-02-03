@@ -5,7 +5,7 @@
  * @module
  */
 
-import { z } from 'zod';
+import { z } from "zod";
 
 // ============ Metadata ============
 
@@ -28,7 +28,10 @@ export type TokenSchema = z.infer<typeof TokenSchemaSchema>;
 export const PlaceSchema = z.object({
   id: z
     .string()
-    .regex(/^[a-z][a-z0-9_-]*$/, 'Place ID must be lowercase alphanumeric with underscores/hyphens'),
+    .regex(
+      /^[a-z][a-z0-9_-]*$/,
+      "Place ID must be lowercase alphanumeric with underscores/hyphens",
+    ),
   initialTokens: z.number().int().min(0).default(0),
   capacity: z.number().int().min(1).nullable().default(null),
   tokenSchema: TokenSchemaSchema,
@@ -50,9 +53,9 @@ export type Arc = z.infer<typeof ArcSchema>;
 
 export const TolerationSchema = z.object({
   key: z.string().optional(),
-  operator: z.enum(['Exists', 'Equal']).optional(),
+  operator: z.enum(["Exists", "Equal"]).optional(),
   value: z.string().optional(),
-  effect: z.enum(['NoSchedule', 'PreferNoSchedule', 'NoExecute']).optional(),
+  effect: z.enum(["NoSchedule", "PreferNoSchedule", "NoExecute"]).optional(),
 });
 
 export const ResourcesSchema = z.object({
@@ -75,10 +78,57 @@ export const ResourcesSchema = z.object({
 
 export type Resources = z.infer<typeof ResourcesSchema>;
 
+// ============ Engine Configuration ============
+
+/**
+ * Engine execution mode for hybrid cloud support.
+ * - local: Use local Dagger installation (fastest for development)
+ * - cloud: Use Circuit Breaker Engine Service (for production/GPU)
+ * - auto: Automatically select based on requirements
+ */
+export const EngineModeSchema = z
+  .enum(["local", "cloud", "auto"])
+  .default("auto");
+
+export type EngineMode = z.infer<typeof EngineModeSchema>;
+
+/**
+ * Resource requirements that influence engine selection in auto mode.
+ */
+export const EngineRequirementsSchema = z.object({
+  /** Require GPU access (forces cloud mode) */
+  gpu: z.boolean().default(false),
+  /** Minimum memory in GB (>16GB suggests cloud) */
+  memoryGb: z.number().int().min(1).optional(),
+  /** Minimum CPU cores (>8 suggests cloud) */
+  cpuCores: z.number().int().min(1).optional(),
+  /** Required Dagger engine version */
+  engineVersion: z.string().optional(),
+  /** Require audit trail for compliance (forces cloud) */
+  requireAudit: z.boolean().default(false),
+  /** Custom labels for engine selection */
+  labels: z.record(z.string()).optional(),
+});
+
+export type EngineRequirements = z.infer<typeof EngineRequirementsSchema>;
+
+/**
+ * Engine configuration for a workflow or transition.
+ * Controls whether execution happens locally or in the cloud.
+ */
+export const EngineConfigSchema = z.object({
+  /** Execution mode: local, cloud, or auto */
+  mode: EngineModeSchema,
+  /** Resource requirements that influence auto mode selection */
+  requirements: EngineRequirementsSchema.optional(),
+});
+
+export type EngineConfig = z.infer<typeof EngineConfigSchema>;
+
 // ============ Actions ============
 
 export const DaggerActionSchema = z.object({
-  type: z.literal('dagger'),
+  type: z.literal("dagger"),
   module: z.string(),
   function: z.string().optional(),
   args: z.record(z.any()).optional(),
@@ -89,9 +139,9 @@ export const DaggerActionSchema = z.object({
 export type DaggerAction = z.infer<typeof DaggerActionSchema>;
 
 export const HttpActionSchema = z.object({
-  type: z.literal('http'),
+  type: z.literal("http"),
   url: z.string().url(),
-  method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']).default('POST'),
+  method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).default("POST"),
   headers: z.record(z.string()).optional(),
   body: z.string().optional(),
   expectedStatus: z.array(z.number().int()).default([200, 201, 202, 204]),
@@ -100,8 +150,8 @@ export const HttpActionSchema = z.object({
 export type HttpAction = z.infer<typeof HttpActionSchema>;
 
 export const ScriptActionSchema = z.object({
-  type: z.literal('script'),
-  runtime: z.enum(['bun', 'deno', 'node']).default('bun'),
+  type: z.literal("script"),
+  runtime: z.enum(["bun", "deno", "node"]).default("bun"),
   code: z.string().optional(),
   file: z.string().optional(),
 });
@@ -109,12 +159,12 @@ export const ScriptActionSchema = z.object({
 export type ScriptAction = z.infer<typeof ScriptActionSchema>;
 
 export const NoopActionSchema = z.object({
-  type: z.literal('noop'),
+  type: z.literal("noop"),
 });
 
 export type NoopAction = z.infer<typeof NoopActionSchema>;
 
-export const ActionSchema = z.discriminatedUnion('type', [
+export const ActionSchema = z.discriminatedUnion("type", [
   DaggerActionSchema,
   HttpActionSchema,
   ScriptActionSchema,
@@ -123,6 +173,17 @@ export const ActionSchema = z.discriminatedUnion('type', [
 
 export type Action = z.infer<typeof ActionSchema>;
 
+// ============ Policy Gate ============
+
+export const PolicyGateSchema = z.object({
+  path: z.string(),
+  query: z.string().default("data.main.deny"),
+  input: z.string().default("*.json"),
+  failOpen: z.boolean().default(false),
+});
+
+export type PolicyGate = z.infer<typeof PolicyGateSchema>;
+
 // ============ Transition ============
 
 export const TransitionSchema = z.object({
@@ -130,19 +191,22 @@ export const TransitionSchema = z.object({
     .string()
     .regex(
       /^[a-z][a-z0-9_-]*$/,
-      'Transition ID must be lowercase alphanumeric with underscores/hyphens'
+      "Transition ID must be lowercase alphanumeric with underscores/hyphens",
     ),
   inputs: z.array(ArcSchema),
   outputs: z.array(ArcSchema),
-  guard: z.string().optional(), // CEL expression
+  guard: z.string().optional(), // CEL expression (pre-check)
   action: ActionSchema,
+  policy: PolicyGateSchema.optional(), // OPA/conftest policy gate (post-check)
   resources: ResourcesSchema.optional(),
+  /** Engine configuration override for this transition */
+  engine: EngineConfigSchema.optional(),
   timeout: z
     .string()
     .regex(/^[0-9]+(s|m|h)$/)
-    .default('5m'),
+    .default("5m"),
   retries: z.number().int().min(0).max(10).default(0),
-  retryBackoff: z.enum(['fixed', 'exponential']).default('exponential'),
+  retryBackoff: z.enum(["fixed", "exponential"]).default("exponential"),
   priority: z.number().int().min(0).max(100).default(50),
 });
 
@@ -154,19 +218,24 @@ const WorkflowNameSchema = z
   .string()
   .min(2)
   .max(63)
-  .regex(/^[a-z][a-z0-9-]*[a-z0-9]$/, 'Workflow name must be DNS-compatible (lowercase, hyphens)');
+  .regex(
+    /^[a-z][a-z0-9-]*[a-z0-9]$/,
+    "Workflow name must be DNS-compatible (lowercase, hyphens)",
+  );
 
 const NamespaceSchema = z
   .string()
   .regex(/^[a-z][a-z0-9-]*[a-z0-9]$/)
-  .default('default');
+  .default("default");
 
 export const WorkflowSchema = z
   .object({
-    version: z.literal('1.0'),
+    version: z.literal("1.0"),
     name: WorkflowNameSchema,
     namespace: NamespaceSchema,
     metadata: MetadataSchema.optional(),
+    /** Default engine configuration for all transitions */
+    engine: EngineConfigSchema.optional(),
     places: z.array(PlaceSchema).min(1),
     transitions: z.array(TransitionSchema).min(1),
   })
@@ -190,8 +259,8 @@ export const WorkflowSchema = z
       return true;
     },
     {
-      message: 'All arc references must point to valid place IDs',
-    }
+      message: "All arc references must point to valid place IDs",
+    },
   )
   .refine(
     (workflow) => {
@@ -200,8 +269,8 @@ export const WorkflowSchema = z
       return new Set(placeIds).size === placeIds.length;
     },
     {
-      message: 'Place IDs must be unique',
-    }
+      message: "Place IDs must be unique",
+    },
   )
   .refine(
     (workflow) => {
@@ -210,8 +279,8 @@ export const WorkflowSchema = z
       return new Set(transitionIds).size === transitionIds.length;
     },
     {
-      message: 'Transition IDs must be unique',
-    }
+      message: "Transition IDs must be unique",
+    },
   );
 
 export type Workflow = z.infer<typeof WorkflowSchema>;
@@ -232,7 +301,9 @@ export function parseWorkflow(data: unknown): Workflow {
   return WorkflowSchema.parse(data);
 }
 
-export function safeParseWorkflow(data: unknown): z.SafeParseReturnType<unknown, Workflow> {
+export function safeParseWorkflow(
+  data: unknown,
+): z.SafeParseReturnType<unknown, Workflow> {
   return WorkflowSchema.safeParse(data);
 }
 

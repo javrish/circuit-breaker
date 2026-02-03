@@ -89,12 +89,16 @@ pub struct Transition {
     /// Output arcs to places.
     pub outputs: Vec<Arc>,
 
-    /// CEL expression guard condition.
+    /// CEL expression guard condition (pre-check on token data).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<String>,
 
     /// Action to execute when transition fires.
     pub action: Action,
+
+    /// Policy gate to validate action outputs (post-check via conftest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyGate>,
 
     /// Resource requirements for execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -196,6 +200,35 @@ pub struct DaggerAction {
 
 fn default_cache() -> bool {
     true
+}
+
+/// Policy gate configuration for validating action outputs.
+/// Runs conftest with the specified policies against action outputs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyGate {
+    /// Path to policy directory containing .rego files.
+    pub path: String,
+
+    /// Rego query to evaluate (default: "data.main.deny").
+    #[serde(default = "default_policy_query")]
+    pub query: String,
+
+    /// Input file pattern from action outputs (default: "*.json").
+    #[serde(default = "default_policy_input")]
+    pub input: String,
+
+    /// Fail-open behavior (default: false - deny on error).
+    #[serde(default)]
+    pub fail_open: bool,
+}
+
+fn default_policy_query() -> String {
+    "data.main.deny".to_string()
+}
+
+fn default_policy_input() -> String {
+    "*.json".to_string()
 }
 
 /// HTTP request action.
@@ -462,6 +495,7 @@ mod tests {
                 }],
                 guard: None,
                 action: Action::Noop,
+                policy: None,
                 resources: None,
                 timeout: "5m".to_string(),
                 retries: 0,

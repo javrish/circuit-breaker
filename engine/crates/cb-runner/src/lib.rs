@@ -7,9 +7,12 @@
 //!
 //! ## Features
 //!
-//! - Dagger pipeline execution
-//! - HTTP action execution
-//! - Script (Bun/Deno/Node) execution
+//! - **Hybrid Execution**: Support for local and cloud Dagger engines
+//! - **Automatic Engine Selection**: Choose the best engine based on requirements
+//! - **Dagger pipeline execution** via dagger-sdk
+//! - **Policy gate validation** via conftest
+//! - **HTTP action execution**
+//! - **Script (Bun/Deno/Node) execution**
 //! - Resource management and limits
 //! - Artifact collection and upload
 //! - Structured logging and metrics
@@ -20,25 +23,63 @@
 //!
 //! 1. Subscribes to task dispatch events from NATS
 //! 2. Claims and executes tasks matching its runner pool
-//! 3. Executes the action (Dagger, HTTP, script)
-//! 4. Publishes task completion/failure events
-//! 5. Uploads artifacts to object storage
+//! 3. Selects the appropriate engine (local or cloud) based on requirements
+//! 4. Executes the action (Dagger, HTTP, script)
+//! 5. If policy is configured, runs conftest validation
+//! 6. Publishes task completion/failure events
+//! 7. Uploads artifacts to object storage
+//!
+//! ## Hybrid Execution Model
+//!
+//! The runner supports three execution modes:
+//!
+//! - **Local**: Use local Dagger installation (fastest for development)
+//! - **Cloud**: Use Circuit Breaker Engine Service (for production/GPU workloads)
+//! - **Auto**: Automatically select based on requirements and availability
+//!
+//! ```rust,no_run
+//! use cb_runner::engine::{EngineSelector, SelectedEngine, EngineExecutor};
+//! use cb_core::engine::{EngineConfig, EngineRequirements};
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Create selector with auto mode
+//! let config = EngineConfig::auto();
+//! let selector = EngineSelector::new(config).await?;
+//!
+//! // Select engine based on requirements
+//! let requirements = EngineRequirements::default();
+//! let engine = selector.select(&requirements).await?;
+//!
+//! // Execute a Dagger module
+//! let result = engine.executor().execute("github.com/myorg/ci", Some("build"), None).await?;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! ## Deployment
 //!
 //! Runners are deployed as Kubernetes pods with:
-//! - Dagger engine sidecar (for Dagger actions)
+//! - Dagger engine sidecar (for Dagger actions) or local Dagger
 //! - Appropriate resource requests/limits
 //! - Node affinity for Karpenter-provisioned nodes
 //! - Tolerations for runner taints
+//!
+//! For local development, ensure Dagger and a container runtime (Docker/Podman)
+//! are installed and running.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod engine;
+
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use cb_core::workflow::Action;
+use tokio::sync::Mutex;
+
+use cb_core::workflow::{Action, PolicyGate};
 use cb_core::error::Result;
 
 /// Configuration for the runner.
@@ -49,11 +90,16 @@ pub struct RunnerConfig {
     /// NATS server URL.
     pub nats_url: String,
     /// Dagger engine URL (if using remote engine).
+    /// If not set, uses local engine via dagger-sdk auto-provisioning.
     pub dagger_url: Option<String>,
     /// Default timeout for actions.
     pub default_timeout: Duration,
     /// Working directory for script execution.
     pub work_dir: String,
+    /// Directory containing policy files (.rego).
+    pub policies_dir: Option<PathBuf>,
+    /// Conftest image to use for policy validation.
+    pub conftest_image: String,
 }
 
 impl Default for RunnerConfig {
@@ -64,6 +110,8 @@ impl Default for RunnerConfig {
             dagger_url: None,
             default_timeout: Duration::from_secs(300),
             work_dir: "/tmp/cb-runner".to_string(),
+            policies_dir: None,
+            conftest_image: "openpolicyagent/conftest:latest".to_string(),
         }
     }
 }
@@ -130,6 +178,8 @@ pub struct ExecutionContext {
     pub environment: HashMap<String, String>,
     /// Timeout for this execution.
     pub timeout: Duration,
+    /// Optional policy gate to validate outputs.
+    pub policy: Option<PolicyGate>,
 }
 
 impl Default for ExecutionContext {
@@ -142,6 +192,42 @@ impl Default for ExecutionContext {
             input_data: None,
             environment: HashMap::new(),
             timeout: Duration::from_secs(300), // 5 minutes default
+            policy: None,
+        }
+    }
+}
+
+/// Result of policy evaluation.
+#[derive(Debug, Clone)]
+pub struct PolicyResult {
+    /// Whether the policy passed.
+    pub passed: bool,
+    /// Violations found (if any).
+    pub violations: Vec<String>,
+    /// Warnings (non-blocking).
+    pub warnings: Vec<String>,
+    /// Raw output from conftest.
+    pub raw_output: Option<String>,
+}
+
+impl PolicyResult {
+    /// Create a passing result.
+    pub fn pass() -> Self {
+        Self {
+            passed: true,
+            violations: vec![],
+            warnings: vec![],
+            raw_output: None,
+        }
+    }
+
+    /// Create a failing result with violations.
+    pub fn fail(violations: Vec<String>) -> Self {
+        Self {
+            passed: false,
+            violations,
+            warnings: vec![],
+            raw_output: None,
         }
     }
 }
@@ -159,6 +245,9 @@ impl ActionExecutor {
     }
 
     /// Execute an action and return the result.
+    ///
+    /// If a policy gate is configured in the context, the action outputs
+    /// will be validated against the policy after execution.
     pub async fn execute(&self, action: &Action, context: ExecutionContext) -> Result<ExecutionResult> {
         let start = std::time::Instant::now();
 
@@ -185,90 +274,526 @@ impl ActionExecutor {
             }
         };
 
-        result
+        // If action succeeded and policy is configured, validate outputs
+        match result {
+            Ok(mut exec_result) if exec_result.success && context.policy.is_some() => {
+                let policy = context.policy.as_ref().unwrap();
+                match self.evaluate_policy(policy, &exec_result).await {
+                    Ok(policy_result) => {
+                        if !policy_result.passed {
+                            exec_result.success = false;
+                            exec_result.error = Some(format!(
+                                "Policy validation failed: {}",
+                                policy_result.violations.join(", ")
+                            ));
+                            tracing::warn!(
+                                policy_path = %policy.path,
+                                violations = ?policy_result.violations,
+                                "Policy gate failed"
+                            );
+                        } else {
+                            tracing::info!(
+                                policy_path = %policy.path,
+                                "Policy gate passed"
+                            );
+                        }
+                        Ok(exec_result)
+                    }
+                    Err(e) => {
+                        // Policy evaluation error
+                        if policy.fail_open {
+                            tracing::warn!(
+                                error = %e,
+                                policy_path = %policy.path,
+                                "Policy evaluation failed, but fail_open=true, continuing"
+                            );
+                            Ok(exec_result)
+                        } else {
+                            exec_result.success = false;
+                            exec_result.error = Some(format!("Policy evaluation error: {}", e));
+                            Ok(exec_result)
+                        }
+                    }
+                }
+            }
+            other => other,
+        }
     }
 
+    /// Execute a Dagger pipeline action.
+    ///
+    /// For local mode: runs `dagger call -m <module> <function> --args` directly.
+    /// For cloud mode: requests engine from Engine Service and executes via GraphQL.
     async fn execute_dagger(
         &self,
         action: &cb_core::workflow::DaggerAction,
-        _context: &ExecutionContext,
+        context: &ExecutionContext,
     ) -> Result<ExecutionResult> {
-        // TODO: Implement Dagger execution via GraphQL API
         let start = std::time::Instant::now();
 
         tracing::info!(
             module = %action.module,
             function = ?action.function,
+            task_id = %context.task_id,
             "Executing Dagger action"
         );
 
-        // Placeholder implementation
-        Ok(ExecutionResult {
-            success: true,
-            outputs: Some(serde_json::json!({
-                "module": action.module,
-                "function": action.function,
-            })),
-            artifacts: vec![],
-            duration: start.elapsed(),
-            resource_usage: ResourceUsage::default(),
-            error: None,
-            logs: Some("Dagger execution placeholder".to_string()),
-        })
+        // Build dagger call command: dagger call -m <module> <function> --arg1=val1 --arg2=val2
+        let mut cmd = tokio::process::Command::new("dagger");
+        cmd.arg("call");
+        cmd.arg("-m");
+        cmd.arg(&action.module);
+
+        if let Some(ref func) = action.function {
+            cmd.arg(func);
+        }
+
+        // Add function arguments (with token interpolation)
+        if let Some(ref args_map) = action.args {
+            for (key, value) in args_map {
+                let resolved_value = match value {
+                    serde_json::Value::String(s) => {
+                        // Resolve ctx.token.* references from input_data
+                        if s.starts_with("ctx.token.") {
+                            let token_key = s.strip_prefix("ctx.token.").unwrap();
+                            if let Some(ref input_data) = context.input_data {
+                                if let Some(v) = input_data.get(token_key) {
+                                    match v {
+                                        serde_json::Value::String(sv) => Some(sv.clone()),
+                                        serde_json::Value::Null => None,
+                                        other => Some(other.to_string()),
+                                    }
+                                } else {
+                                    tracing::debug!(key = %token_key, "Token key not found in input_data, skipping arg");
+                                    None
+                                }
+                            } else {
+                                tracing::debug!("No input_data available for token interpolation, skipping arg");
+                                None
+                            }
+                        } else {
+                            Some(s.clone())
+                        }
+                    }
+                    serde_json::Value::Null => None,
+                    other => Some(other.to_string()),
+                };
+                // Only add the arg if we have a resolved value
+                if let Some(val) = resolved_value {
+                    cmd.arg(format!("--{}={}", key, val));
+                }
+            }
+        }
+
+        // Add environment variables
+        for (key, value) in &context.environment {
+            cmd.env(key, value);
+        }
+
+        tracing::info!(command = ?cmd, "Running dagger command");
+
+        let output = match cmd.output().await {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to execute dagger command");
+                return Ok(ExecutionResult {
+                    success: false,
+                    outputs: None,
+                    artifacts: vec![],
+                    duration: start.elapsed(),
+                    resource_usage: ResourceUsage::default(),
+                    error: Some(format!("Failed to execute dagger: {}", e)),
+                    logs: None,
+                });
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        tracing::info!(stdout = %stdout, stderr = %stderr, status = ?output.status, "Dagger command completed");
+
+        if output.status.success() {
+            tracing::info!(
+                module = %action.module,
+                function = ?action.function,
+                "Dagger action completed successfully"
+            );
+
+            Ok(ExecutionResult {
+                success: true,
+                outputs: Some(serde_json::json!({
+                    "module": action.module,
+                    "function": action.function,
+                    "stdout": stdout,
+                })),
+                artifacts: vec![],
+                duration: start.elapsed(),
+                resource_usage: ResourceUsage::default(),
+                error: None,
+                logs: Some(stdout),
+            })
+        } else {
+            tracing::error!(
+                module = %action.module,
+                function = ?action.function,
+                stderr = %stderr,
+                "Dagger action failed"
+            );
+
+            Ok(ExecutionResult {
+                success: false,
+                outputs: None,
+                artifacts: vec![],
+                duration: start.elapsed(),
+                resource_usage: ResourceUsage::default(),
+                error: Some(stderr),
+                logs: Some(stdout),
+            })
+        }
     }
 
+    /// Evaluate a policy gate against action outputs using conftest.
+    async fn evaluate_policy(
+        &self,
+        policy: &PolicyGate,
+        exec_result: &ExecutionResult,
+    ) -> eyre::Result<PolicyResult> {
+        tracing::info!(
+            policy_path = %policy.path,
+            query = %policy.query,
+            "Evaluating policy gate"
+        );
+
+        // Serialize outputs to JSON for conftest input
+        let input_json = match &exec_result.outputs {
+            Some(outputs) => serde_json::to_string_pretty(outputs)?,
+            None => "{}".to_string(),
+        };
+
+        let policy_path = policy.path.clone();
+        let conftest_image = self.config.conftest_image.clone();
+
+        // Use shared state to capture output
+        let output_capture: Arc<Mutex<Option<std::result::Result<String, String>>>> =
+            Arc::new(Mutex::new(None));
+        let output_ref = output_capture.clone();
+
+        // Run conftest via Dagger
+        let dagger_result = dagger_sdk::connect(move |client| {
+            let input = input_json.clone();
+            let policies = policy_path.clone();
+            let image = conftest_image.clone();
+            let output_ref = output_ref.clone();
+
+            async move {
+                // Load policy directory from host
+                let policy_dir = client.host().directory(&policies);
+
+                // Run conftest
+                let result = client
+                    .container()
+                    .from(&image)
+                    .with_mounted_directory("/policies", policy_dir)
+                    .with_new_file("/input.json", input)
+                    .with_exec(vec![
+                        "conftest",
+                        "test",
+                        "/input.json",
+                        "--policy", "/policies",
+                        "--output", "json",
+                    ])
+                    .stdout()
+                    .await;
+
+                // Store the result in shared state
+                let mut guard = output_ref.lock().await;
+                *guard = Some(result.map_err(|e| e.to_string()));
+
+                Ok(())
+            }
+        })
+        .await;
+
+        // Extract the captured output
+        let captured = output_capture.lock().await.take();
+
+        match dagger_result {
+            Ok(()) => {
+                match captured {
+                    Some(Ok(json_output)) => {
+                        // Parse conftest JSON output
+                        let parsed: serde_json::Value = serde_json::from_str(&json_output)
+                            .unwrap_or(serde_json::json!([]));
+
+                        let mut violations = Vec::new();
+                        let mut warnings = Vec::new();
+
+                        // conftest outputs an array of results
+                        if let Some(results) = parsed.as_array() {
+                            for result in results {
+                                // Check failures
+                                if let Some(failures) = result.get("failures").and_then(|f| f.as_array()) {
+                                    for failure in failures {
+                                        if let Some(msg) = failure.get("msg").and_then(|m| m.as_str()) {
+                                            violations.push(msg.to_string());
+                                        }
+                                    }
+                                }
+                                // Check warnings
+                                if let Some(warns) = result.get("warnings").and_then(|w| w.as_array()) {
+                                    for warn in warns {
+                                        if let Some(msg) = warn.get("msg").and_then(|m| m.as_str()) {
+                                            warnings.push(msg.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Ok(PolicyResult {
+                            passed: violations.is_empty(),
+                            violations,
+                            warnings,
+                            raw_output: Some(json_output),
+                        })
+                    }
+                    Some(Err(e)) => {
+                        // conftest execution failed - might be policy violations
+                        Err(eyre::eyre!("conftest failed: {}", e))
+                    }
+                    None => {
+                        Err(eyre::eyre!("No output captured from conftest"))
+                    }
+                }
+            }
+            Err(e) => {
+                Err(eyre::eyre!("Dagger connection failed: {}", e))
+            }
+        }
+    }
+
+    /// Execute an HTTP action.
     async fn execute_http(
         &self,
         action: &cb_core::workflow::HttpAction,
-        _context: &ExecutionContext,
+        context: &ExecutionContext,
     ) -> Result<ExecutionResult> {
-        // TODO: Implement HTTP request execution
         let start = std::time::Instant::now();
 
         tracing::info!(
             url = %action.url,
             method = ?action.method,
+            task_id = %context.task_id,
             "Executing HTTP action"
         );
 
-        // Placeholder implementation
-        Ok(ExecutionResult {
-            success: true,
-            outputs: Some(serde_json::json!({
-                "url": action.url,
-                "status": 200,
-            })),
-            artifacts: vec![],
-            duration: start.elapsed(),
-            resource_usage: ResourceUsage::default(),
-            error: None,
-            logs: Some("HTTP execution placeholder".to_string()),
-        })
+        let client = reqwest::Client::new();
+
+        let method = match action.method {
+            cb_core::workflow::HttpMethod::Get => reqwest::Method::GET,
+            cb_core::workflow::HttpMethod::Post => reqwest::Method::POST,
+            cb_core::workflow::HttpMethod::Put => reqwest::Method::PUT,
+            cb_core::workflow::HttpMethod::Patch => reqwest::Method::PATCH,
+            cb_core::workflow::HttpMethod::Delete => reqwest::Method::DELETE,
+        };
+
+        let mut request = client.request(method, &action.url);
+
+        // Add headers
+        if let Some(ref headers) = action.headers {
+            for (key, value) in headers {
+                request = request.header(key, value);
+            }
+        }
+
+        // Add body
+        if let Some(ref body) = action.body {
+            request = request.body(body.clone());
+        }
+
+        // Set timeout
+        request = request.timeout(context.timeout);
+
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let expected = &action.expected_status;
+                let success = expected.iter().any(|s| *s == status);
+
+                let body = response.text().await.unwrap_or_default();
+
+                Ok(ExecutionResult {
+                    success,
+                    outputs: Some(serde_json::json!({
+                        "url": action.url,
+                        "status": status,
+                        "body": body,
+                    })),
+                    artifacts: vec![],
+                    duration: start.elapsed(),
+                    resource_usage: ResourceUsage::default(),
+                    error: if !success {
+                        Some(format!("Unexpected status code: {}", status))
+                    } else {
+                        None
+                    },
+                    logs: Some(body),
+                })
+            }
+            Err(e) => {
+                Ok(ExecutionResult {
+                    success: false,
+                    outputs: None,
+                    artifacts: vec![],
+                    duration: start.elapsed(),
+                    resource_usage: ResourceUsage::default(),
+                    error: Some(e.to_string()),
+                    logs: None,
+                })
+            }
+        }
     }
 
+    /// Execute a script action using Dagger.
     async fn execute_script(
         &self,
         action: &cb_core::workflow::ScriptAction,
-        _context: &ExecutionContext,
+        context: &ExecutionContext,
     ) -> Result<ExecutionResult> {
-        // TODO: Implement script execution
         let start = std::time::Instant::now();
+
+        let runtime_image = match action.runtime {
+            cb_core::workflow::ScriptRuntime::Bun => "oven/bun:latest",
+            cb_core::workflow::ScriptRuntime::Deno => "denoland/deno:latest",
+            cb_core::workflow::ScriptRuntime::Node => "node:20-alpine",
+        };
+
+        let runtime_cmd = match action.runtime {
+            cb_core::workflow::ScriptRuntime::Bun => "bun",
+            cb_core::workflow::ScriptRuntime::Deno => "deno",
+            cb_core::workflow::ScriptRuntime::Node => "node",
+        };
 
         tracing::info!(
             runtime = ?action.runtime,
+            image = %runtime_image,
+            task_id = %context.task_id,
             "Executing script action"
         );
 
-        // Placeholder implementation
-        Ok(ExecutionResult {
-            success: true,
-            outputs: None,
-            artifacts: vec![],
-            duration: start.elapsed(),
-            resource_usage: ResourceUsage::default(),
-            error: None,
-            logs: Some("Script execution placeholder".to_string()),
+        let code = action.code.clone();
+        let file = action.file.clone();
+        let env = context.environment.clone();
+
+        // Use shared state to capture output
+        let output_capture: Arc<Mutex<Option<std::result::Result<String, String>>>> =
+            Arc::new(Mutex::new(None));
+        let output_ref = output_capture.clone();
+
+        let script_result = dagger_sdk::connect(move |client| {
+            let code = code.clone();
+            let file = file.clone();
+            let env = env.clone();
+            let image = runtime_image.to_string();
+            let cmd = runtime_cmd.to_string();
+            let output_ref = output_ref.clone();
+
+            async move {
+                let mut container = client
+                    .container()
+                    .from(&image);
+
+                // Add environment variables
+                for (key, value) in env {
+                    container = container.with_env_variable(&key, &value);
+                }
+
+                // Either run inline code or a file
+                let result = if let Some(code_content) = code {
+                    container
+                        .with_new_file("/script.js", code_content)
+                        .with_exec(vec![&cmd, "/script.js"])
+                        .stdout()
+                        .await
+                        .map_err(|e| e.to_string())
+                } else if let Some(file_path) = file {
+                    let script_file = client.host().file(&file_path);
+                    container
+                        .with_file("/script.js", script_file)
+                        .with_exec(vec![&cmd, "/script.js"])
+                        .stdout()
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err("Script action requires either 'code' or 'file'".to_string())
+                };
+
+                // Store the result in shared state
+                let mut guard = output_ref.lock().await;
+                *guard = Some(result);
+
+                Ok(())
+            }
         })
+        .await;
+
+        // Extract the captured output
+        let captured = output_capture.lock().await.take();
+
+        match script_result {
+            Ok(()) => {
+                match captured {
+                    Some(Ok(output)) => {
+                        Ok(ExecutionResult {
+                            success: true,
+                            outputs: Some(serde_json::json!({
+                                "runtime": format!("{:?}", action.runtime),
+                                "output": output,
+                            })),
+                            artifacts: vec![],
+                            duration: start.elapsed(),
+                            resource_usage: ResourceUsage::default(),
+                            error: None,
+                            logs: Some(output),
+                        })
+                    }
+                    Some(Err(e)) => {
+                        Ok(ExecutionResult {
+                            success: false,
+                            outputs: None,
+                            artifacts: vec![],
+                            duration: start.elapsed(),
+                            resource_usage: ResourceUsage::default(),
+                            error: Some(e),
+                            logs: None,
+                        })
+                    }
+                    None => {
+                        Ok(ExecutionResult {
+                            success: false,
+                            outputs: None,
+                            artifacts: vec![],
+                            duration: start.elapsed(),
+                            resource_usage: ResourceUsage::default(),
+                            error: Some("No output captured from script".to_string()),
+                            logs: None,
+                        })
+                    }
+                }
+            }
+            Err(e) => {
+                Ok(ExecutionResult {
+                    success: false,
+                    outputs: None,
+                    artifacts: vec![],
+                    duration: start.elapsed(),
+                    resource_usage: ResourceUsage::default(),
+                    error: Some(e.to_string()),
+                    logs: None,
+                })
+            }
+        }
     }
 }
 
@@ -276,6 +801,9 @@ impl ActionExecutor {
 ///
 /// This is the main entry point for action execution, dispatching
 /// to the appropriate executor based on action type.
+///
+/// If the context includes a policy gate, the outputs will be validated
+/// against the policy using conftest after successful execution.
 ///
 /// # Errors
 ///
@@ -289,11 +817,28 @@ pub async fn execute_action(
     executor.execute(action, context).await
 }
 
+/// Execute an action with a policy gate.
+///
+/// Convenience function that sets up the policy in the execution context.
+///
+/// # Errors
+///
+/// Returns an error if the action execution or policy validation fails.
+pub async fn execute_action_with_policy(
+    action: &Action,
+    policy: PolicyGate,
+    config: &RunnerConfig,
+    mut context: ExecutionContext,
+) -> Result<ExecutionResult> {
+    context.policy = Some(policy);
+    execute_action(action, config, context).await
+}
+
 /// Prelude for convenient imports.
 pub mod prelude {
     pub use crate::{
-        execute_action, ActionExecutor, Artifact, ExecutionContext, ExecutionResult,
-        ResourceUsage, RunnerConfig,
+        execute_action, execute_action_with_policy, ActionExecutor, Artifact,
+        ExecutionContext, ExecutionResult, PolicyResult, ResourceUsage, RunnerConfig,
     };
 }
 

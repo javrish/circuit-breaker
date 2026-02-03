@@ -1,0 +1,7 @@
+{
+  "name": "vcs",
+  "engineVersion": "v0.19.10",
+  "sdk": {
+    "source": "typescript"
+  }
+}
