@@ -189,7 +189,7 @@ impl Runner {
             }
             Action::Noop => {
                 debug!("Executing noop action");
-                Ok(serde_json::json!({"status": "noop"}))
+                Ok(serde_json::json!({"status": "done", "message": "Workflow completed successfully"}))
             }
         }
     }
@@ -317,11 +317,24 @@ impl Runner {
         let output = cmd.output().await?;
 
         if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            Ok(serde_json::json!({
-                "status": "success",
-                "output": stdout.to_string(),
-            }))
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+            // Try to parse the output as JSON - if it is, use it directly as token data
+            // This allows dagger modules to return structured data that flows to the next transition
+            match serde_json::from_str::<serde_json::Value>(&stdout) {
+                Ok(json_output) => {
+                    debug!("Dagger output parsed as JSON");
+                    Ok(json_output)
+                }
+                Err(_) => {
+                    // Not JSON, wrap in a standard format
+                    debug!("Dagger output is not JSON, wrapping as string");
+                    Ok(serde_json::json!({
+                        "status": "success",
+                        "output": stdout,
+                    }))
+                }
+            }
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(format!("Dagger execution failed: {}", stderr).into())

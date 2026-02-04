@@ -4,14 +4,25 @@
  * Provides a unified interface for working with different version control systems
  * using URL scheme-based routing:
  *
- * - atomic-https://host/project  → Atomic clone via HTTPS
- * - atomic-ssh://host/project    → Atomic clone via SSH
+ * - /absolute/path               → Local directory (passed via --source flag)
  * - git-https://host/repo        → Git clone via HTTPS
  * - git-ssh://host/repo          → Git clone via SSH
- * - /absolute/path               → Local directory (requires --source)
- * - --source=/path/to/repo       → Local directory (no URL needed)
+ * - atomic-https://host/project  → Atomic clone via HTTPS
+ * - atomic-ssh://host/project    → Atomic clone via SSH
  *
- * Policy evaluation is handled by the Circuit Breaker runner, not this module.
+ * Usage with Circuit Breaker:
+ *
+ *   Local:
+ *     ./cb inject <run-id> start --data '{"url": "/path/to/repo"}'
+ *     # The path is returned and subsequent steps use --source to mount it
+ *
+ *   Remote:
+ *     ./cb inject <run-id> start --data '{"url": "git-https://github.com/org/repo"}'
+ *     # Remote repos are cloned within Dagger, no exportPath needed
+ *
+ * Note: For local paths, Dagger CLI's --source flag automatically mounts
+ * host directories. The workflow passes paths between steps, and each
+ * dagger call uses --source=<path> to mount the directory.
  */
 import { dag, Directory, object, func } from "@dagger.io/dagger";
 
@@ -59,12 +70,12 @@ export class Vcs {
       };
     }
     if (url.startsWith("file://")) {
-      return { vcs: "file", protocol: null, url: url };
+      return { vcs: "file", protocol: null, url };
     }
     if (url.startsWith("/")) {
-      return { vcs: "local", protocol: null, url: url };
+      return { vcs: "local", protocol: null, url };
     }
-    return { vcs: "unknown", protocol: null, url: url };
+    return { vcs: "unknown", protocol: null, url };
   }
 
   /**
@@ -197,6 +208,10 @@ export class Vcs {
 
   /**
    * Get repository info from a checked-out directory
+   *
+   * Returns JSON with VCS-specific metadata:
+   * - Git: hash, subject, author, email, date
+   * - Atomic: currentStack
    */
   @func()
   async info(source: Directory): Promise<string> {
@@ -231,174 +246,93 @@ export class Vcs {
   }
 
   /**
-   * Run ESLint on source directory
+   * Checkout and return path for multi-step workflows
    *
-   * Returns JSON lint results for policy evaluation by the runner.
-   * Requires the project to have an eslint.config.js or .eslintrc.* file.
+   * For local directories: Returns the path directly. Subsequent steps
+   * use Dagger's --source flag to mount the host directory.
+   *
+   * For remote URLs: Clones within Dagger and returns info. The checkout
+   * is passed via --source to subsequent steps within the same session,
+   * or use the lower-level checkout() function for Directory chaining.
+   *
+   * @param url - VCS URL (git-https://, atomic-https://) or local path (/path/to/repo)
+   * @param ref - Optional branch, tag, or channel
+   * @param source - Optional local directory (for Dagger Directory input)
+   *
+   * @returns JSON with { vcs, path, info }
+   *
+   * @example Local directory:
+   *   dagger call checkout-to-path --url=/path/to/local/repo
+   *
+   * @example With source flag (preferred for local):
+   *   dagger call checkout-to-path --source=/path/to/local/repo
+   *
+   * @example Remote git repo:
+   *   dagger call checkout-to-path --url=git-https://github.com/org/repo
    */
   @func()
-  async lint(source: Directory): Promise<string> {
-    return dag
-      .container()
-      .from("node:20-slim")
-      .withDirectory("/src", source)
-      .withWorkdir("/src")
-      .withExec(["npm", "install"])
-      .withExec(["npx", "eslint", ".", "--format", "json"])
-      .stdout();
-  }
-
-  /**
-   * Checkout and lint in one step
-   *
-   * Returns JSON with vcs type and lint results.
-   * Policy evaluation should be done by the runner using .policy() on the transition.
-   */
-  @func()
-  async checkoutAndLint(
+  async checkoutToPath(
     url?: string,
     ref?: string,
     source?: Directory,
   ): Promise<string> {
-    const dir = await this.checkout(url, ref, source);
-    const vcsType = await this.detect(dir);
-    const lintResult = await this.lint(dir);
-
-    return JSON.stringify({
-      vcs: vcsType,
-      lint: JSON.parse(lintResult),
-    });
-  }
-
-  /**
-   * Evaluate OPA/Rego policy against JSON input using conftest
-   *
-   * Runs conftest in a container to evaluate policies.
-   * Returns JSON with pass/fail status and any violations.
-   */
-  @func()
-  async evaluatePolicy(
-    input: string,
-    policies: Directory,
-    query?: string,
-  ): Promise<string> {
-    // Run conftest to check policy pass/fail
-    const container = dag
-      .container()
-      .from("openpolicyagent/conftest:latest")
-      .withDirectory("/policies", policies)
-      .withNewFile("/input.json", input);
-
-    const result = await container
-      .withExec([
-        "/usr/local/bin/conftest",
-        "test",
-        "/input.json",
-        "--policy",
-        "/policies",
-        "--output",
-        "json",
-      ])
-      .stdout();
-
-    // Also get the summary using OPA directly
-    const summaryResult = await dag
-      .container()
-      .from("openpolicyagent/opa:latest")
-      .withDirectory("/policies", policies)
-      .withNewFile("/input.json", input)
-      .withExec([
-        "/opa",
-        "eval",
-        "--data",
-        "/policies",
-        "--input",
-        "/input.json",
-        "--format",
-        "json",
-        "data.quality.summary",
-      ])
-      .stdout();
-
-    // Parse summary
-    let summary: Record<string, unknown> = {};
-    try {
-      const summaryParsed = JSON.parse(summaryResult);
-      if (summaryParsed.result?.[0]?.expressions?.[0]?.value) {
-        summary = summaryParsed.result[0].expressions[0].value;
+    // If source provided directly, use it
+    if (source) {
+      const vcs = await this.detect(source);
+      let info: Record<string, string> = {};
+      try {
+        const infoJson = await this.info(source);
+        info = JSON.parse(infoJson);
+      } catch {
+        // Ignore info errors
       }
-    } catch {
-      // Ignore summary parse errors
+      // Return the url as path if provided, otherwise indicate source was used
+      return JSON.stringify({ vcs, path: url ?? "(source)", info });
     }
 
-    // Parse conftest output to determine pass/fail
-    try {
-      const parsed = JSON.parse(result);
-      const failures: string[] = [];
-      const warnings: string[] = [];
+    if (!url) {
+      throw new Error(
+        "Must provide either --url or --source.\n" +
+          "Examples:\n" +
+          "  Local:  --source=/path/to/repo\n" +
+          "  Local:  --url=/path/to/repo\n" +
+          "  Remote: --url=git-https://github.com/org/repo",
+      );
+    }
 
-      if (Array.isArray(parsed)) {
-        for (const item of parsed) {
-          if (item.failures && Array.isArray(item.failures)) {
-            for (const f of item.failures) {
-              failures.push(f.msg || JSON.stringify(f));
-            }
-          }
-          if (item.warnings && Array.isArray(item.warnings)) {
-            for (const w of item.warnings) {
-              warnings.push(w.msg || JSON.stringify(w));
-            }
-          }
-        }
+    // Check if this is a local path
+    const isLocal = url.startsWith("/");
+
+    if (isLocal) {
+      // For local paths, return the path - caller uses --source to mount
+      const dir = dag.address(url).directory();
+      const vcs = await this.detect(dir);
+
+      let info: Record<string, string> = {};
+      try {
+        const infoJson = await this.info(dir);
+        info = JSON.parse(infoJson);
+      } catch {
+        // Ignore info errors
       }
 
-      return JSON.stringify({
-        passed: failures.length === 0,
-        failures,
-        warnings,
-        summary,
-        raw: parsed,
-      });
-    } catch {
-      return JSON.stringify({
-        passed: false,
-        failures: ["Failed to parse conftest output"],
-        warnings: [],
-        summary,
-        raw: result,
-      });
+      return JSON.stringify({ vcs, path: url, info });
     }
-  }
 
-  /**
-   * Full code quality workflow: checkout + lint + policy evaluation
-   *
-   * This is the complete pipeline that runs checkout, lint, and policy check
-   * all within Dagger containers.
-   */
-  @func()
-  async codeQuality(
-    url?: string,
-    ref?: string,
-    source?: Directory,
-    policies?: Directory,
-  ): Promise<string> {
+    // Remote URL - checkout via git/atomic
     const dir = await this.checkout(url, ref, source);
-    const vcsType = await this.detect(dir);
-    const lintResult = await this.lint(dir);
+    const vcs = await this.detect(dir);
 
-    const result: Record<string, unknown> = {
-      vcs: vcsType,
-      lint: JSON.parse(lintResult),
-    };
-
-    // Run policy check if policies directory provided
-    if (policies) {
-      const policyInput = JSON.stringify(result);
-      const policyResult = await this.evaluatePolicy(policyInput, policies);
-      result.policy = JSON.parse(policyResult);
+    let info: Record<string, string> = {};
+    try {
+      const infoJson = await this.info(dir);
+      info = JSON.parse(infoJson);
+    } catch {
+      // Ignore info errors
     }
 
-    return JSON.stringify(result);
+    // For remote repos, return the URL as identifier
+    // The actual Directory is available via checkout() for chaining
+    return JSON.stringify({ vcs, path: url, info });
   }
 }
