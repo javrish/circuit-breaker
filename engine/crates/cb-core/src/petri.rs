@@ -409,12 +409,14 @@ mod tests {
                     initial_tokens: 1,
                     capacity: None,
                     token_schema: None,
+                    annotations: Default::default(),
                 },
                 workflow::Place {
                     id: "p2".to_string(),
                     initial_tokens: 0,
                     capacity: None,
                     token_schema: None,
+                    annotations: Default::default(),
                 },
             ],
             transitions: vec![workflow::Transition {

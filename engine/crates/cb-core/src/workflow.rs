@@ -74,6 +74,23 @@ pub struct Place {
     /// JSON Schema for typed tokens (colored Petri nets).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_schema: Option<serde_json::Value>,
+
+    /// Arbitrary key-value annotations attached to this place.
+    ///
+    /// Used by Sherpa and other consumers to attach metadata directly to
+    /// the place definition — tool availability, prompt keys, HITL flags,
+    /// or any other consumer-specific metadata.
+    ///
+    /// # Sherpa convention
+    ///
+    /// Sherpa reads the following annotation keys at runtime:
+    ///
+    /// - `sherpa.tools`  — tool set available to the LLM in this phase:
+    ///                     `"none"` | `"read_only"` | `"read_and_todo"` | `"all"` | `"read_and_write"`
+    /// - `sherpa.prompt` — prompt key looked up in the engine's prompt registry
+    /// - `sherpa.hitl`   — `"true"` if the LLM is paused waiting for human input
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub annotations: std::collections::HashMap<String, String>,
 }
 
 /// A transition (action) in the Petri net.
@@ -473,12 +490,14 @@ mod tests {
                     initial_tokens: 1,
                     capacity: None,
                     token_schema: None,
+                    annotations: Default::default(),
                 },
                 Place {
                     id: "end".to_string(),
                     initial_tokens: 0,
                     capacity: None,
                     token_schema: None,
+                    annotations: Default::default(),
                 },
             ],
             transitions: vec![Transition {
@@ -539,18 +558,21 @@ mod tests {
                     initial_tokens: 2,
                     capacity: None,
                     token_schema: None,
+                    annotations: Default::default(),
                 },
                 Place {
                     id: "b".to_string(),
                     initial_tokens: 0,
                     capacity: None,
                     token_schema: None,
+                    annotations: Default::default(),
                 },
                 Place {
                     id: "c".to_string(),
                     initial_tokens: 1,
                     capacity: None,
                     token_schema: None,
+                    annotations: Default::default(),
                 },
             ],
             transitions: vec![],

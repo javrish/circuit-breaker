@@ -96,6 +96,13 @@
         "tokenSchema": {
           "$ref": "#/$defs/tokenSchema",
           "description": "Schema for colored/typed tokens"
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Arbitrary key-value annotations for this place. Used by Sherpa and other consumers to attach metadata (e.g. tool availability, prompt keys, HITL flags) directly to the place definition."
         }
       }
     },

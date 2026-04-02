@@ -80,6 +80,22 @@ export interface PlaceOptions {
   capacity?: number | null;
   /** JSON Schema for typed tokens (colored Petri nets) */
   tokenSchema?: Record<string, unknown>;
+  /**
+   * Arbitrary key-value annotations attached to this place.
+   *
+   * Used by Sherpa and other consumers to attach metadata directly to
+   * the place definition — tool availability, prompt keys, HITL flags,
+   * or any other consumer-specific metadata.
+   *
+   * @example
+   * // Sherpa workflow annotations
+   * annotations: {
+   *   "sherpa.tools":  "read_only",  // "none" | "read_only" | "read_and_todo" | "all" | "read_and_write"
+   *   "sherpa.prompt": "casing",     // prompt key looked up in the engine's prompt registry
+   *   "sherpa.hitl":   "false",      // "true" = LLM paused, waiting for human input
+   * }
+   */
+  annotations?: Record<string, string>;
 }
 
 /**
@@ -202,6 +218,7 @@ export class WorkflowBuilder {
       initialTokens: options.initialTokens ?? 0,
       capacity: options.capacity ?? null,
       tokenSchema: options.tokenSchema,
+      annotations: options.annotations,
     });
     return this;
   }

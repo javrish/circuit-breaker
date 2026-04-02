@@ -35,6 +35,22 @@ export const PlaceSchema = z.object({
   initialTokens: z.number().int().min(0).default(0),
   capacity: z.number().int().min(1).nullable().default(null),
   tokenSchema: TokenSchemaSchema,
+  /**
+   * Arbitrary key-value annotations attached to this place.
+   *
+   * Used by Sherpa and other consumers to attach metadata directly to
+   * the place definition — tool availability, prompt keys, HITL flags,
+   * or any other consumer-specific metadata.
+   *
+   * @example
+   * // Sherpa workflow annotations
+   * annotations: {
+   *   "sherpa.tools":  "read_only",  // "none" | "read_only" | "read_and_todo" | "all" | "read_and_write"
+   *   "sherpa.prompt": "casing",     // prompt key looked up in the engine's prompt registry
+   *   "sherpa.hitl":   "false",      // "true" = LLM paused, waiting for human input
+   * }
+   */
+  annotations: z.record(z.string()).optional(),
 });
 
 export type Place = z.infer<typeof PlaceSchema>;
