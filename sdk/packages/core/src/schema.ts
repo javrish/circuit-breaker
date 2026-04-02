@@ -224,6 +224,21 @@ export const TransitionSchema = z.object({
   retries: z.number().int().min(0).max(10).default(0),
   retryBackoff: z.enum(["fixed", "exponential"]).default("exponential"),
   priority: z.number().int().min(0).max(100).default(50),
+  /**
+   * Arbitrary key-value annotations attached to this transition.
+   *
+   * Used by Sherpa and other consumers to attach metadata directly to
+   * the transition definition — human-readable labels, UI variant hints,
+   * or any other consumer-specific metadata.
+   *
+   * @example
+   * // Sherpa HITL action annotations
+   * annotations: {
+   *   "sherpa.label":   "Accept plan",  // human-readable button label
+   *   "sherpa.variant": "primary",      // "primary" | "danger" | "ghost"
+   * }
+   */
+  annotations: z.record(z.string()).optional(),
 });
 
 export type Transition = z.infer<typeof TransitionSchema>;

@@ -301,6 +301,7 @@ export class TransitionBuilder {
     retries: number;
     retryBackoff: "fixed" | "exponential";
     priority: number;
+    annotations?: Record<string, string>;
   };
 
   constructor(
@@ -316,6 +317,30 @@ export class TransitionBuilder {
       retryBackoff: "exponential",
       priority: 50,
     };
+  }
+
+  /**
+   * Attach arbitrary key-value annotations to this transition.
+   *
+   * Used by Sherpa to describe HITL actions to the frontend:
+   *   - `sherpa.label`   — human-readable button label (e.g. "Accept plan")
+   *   - `sherpa.variant` — button style: "primary" | "danger" | "ghost"
+   *
+   * Other consumers can use any keys they need.
+   *
+   * @example
+   * .transition("accept")
+   *   .from("human_gate").to("executing")
+   *   .annotate({ "sherpa.label": "Accept plan", "sherpa.variant": "primary" })
+   *   .noop()
+   *   .done()
+   */
+  annotate(annotations: Record<string, string>): this {
+    this._transition.annotations = {
+      ...this._transition.annotations,
+      ...annotations,
+    };
+    return this;
   }
 
   /**

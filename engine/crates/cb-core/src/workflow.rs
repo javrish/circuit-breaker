@@ -136,6 +136,22 @@ pub struct Transition {
     /// Priority for scheduling (0-100, higher = more priority).
     #[serde(default = "default_priority")]
     pub priority: u8,
+
+    /// Arbitrary key-value annotations attached to this transition.
+    ///
+    /// Used by Sherpa and other consumers to attach metadata directly to
+    /// the transition definition — human-readable labels, UI variant hints,
+    /// or any other consumer-specific metadata.
+    ///
+    /// # Sherpa convention
+    ///
+    /// Sherpa reads the following annotation keys at runtime to render
+    /// HITL action buttons in the frontend:
+    ///
+    /// - `sherpa.label`   — human-readable button label (e.g. "Accept plan")
+    /// - `sherpa.variant` — button style: `"primary"` | `"danger"` | `"ghost"`
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub annotations: std::collections::HashMap<String, String>,
 }
 
 fn default_timeout() -> String {
@@ -520,6 +536,7 @@ mod tests {
                 retries: 0,
                 retry_backoff: RetryBackoff::Exponential,
                 priority: 50,
+                annotations: Default::default(),
             }],
         };
 

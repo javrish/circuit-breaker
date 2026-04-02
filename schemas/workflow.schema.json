@@ -172,6 +172,13 @@
           "maximum": 100,
           "default": 50,
           "description": "Priority for scheduling (higher = more priority)"
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Arbitrary key-value annotations for this transition. Used by Sherpa and other consumers to attach metadata (e.g. human-readable labels, UI variant hints) directly to the transition definition."
         }
       }
     },

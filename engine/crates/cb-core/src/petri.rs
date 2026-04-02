@@ -439,6 +439,7 @@ mod tests {
                 retries: 0,
                 retry_backoff: workflow::RetryBackoff::Exponential,
                 priority: 50,
+                annotations: Default::default(),
             }],
         }
     }

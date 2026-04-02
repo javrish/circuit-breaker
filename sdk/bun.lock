@@ -53,6 +53,13 @@
         "typescript": ">=5.0.0",
       },
     },
+    "packages/policy": {
+      "name": "@circuit-breaker/policy",
+      "version": "0.1.0",
+      "devDependencies": {
+        "typescript": "^5.0.0",
+      },
+    },
   },
   "packages": {
     "@alcalzone/ansi-tokenize": ["@alcalzone/ansi-tokenize@0.2.4", "", { "dependencies": { "ansi-styles": "^6.2.1", "is-fullwidth-code-point": "^5.0.0" } }, "sha512-HTgrrTgZ9Jgeo6Z3oqbQ7lifOVvRR14vaDuBGPPUxk9Thm+vObaO4QfYYYWw4Zo5CWQDBEfsinFA6Gre+AqwNQ=="],
@@ -62,6 +69,8 @@
     "@circuit-breaker/cli": ["@circuit-breaker/cli@workspace:packages/cli"],
 
     "@circuit-breaker/core": ["@circuit-breaker/core@workspace:packages/core"],
+
+    "@circuit-breaker/policy": ["@circuit-breaker/policy@workspace:packages/policy"],
 
     "@eslint-community/eslint-utils": ["@eslint-community/eslint-utils@4.9.0", "", { "dependencies": { "eslint-visitor-keys": "^3.4.3" }, "peerDependencies": { "eslint": "^6.0.0 || ^7.0.0 || >=8.0.0" } }, "sha512-ayVFHdtZ+hsq1t2Dy24wCmGXGe4q9Gu3smhLYALJrr473ZH27MsnSL+LKUlimp4BWJqMDMLmPpx/Q9R3OAlL4g=="],
 
