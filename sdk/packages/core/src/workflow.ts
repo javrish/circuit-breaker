@@ -23,6 +23,7 @@
  *     .to('deployed')
  *     .guard('ctx.branch == "main"')
  *     .dagger('./ci', 'deploy')
+ *     .policy('./policies/deploy')
  *     .done()
  *
  *   .build();
@@ -40,6 +41,10 @@ import {
   type Action,
   type Resources,
   type Metadata,
+  type PolicyGate,
+  type EngineConfig,
+  type EngineRequirements,
+  type EngineMode,
 } from "./schema";
 
 import { type OpenCodeTaskBuilder, OPENCODE_IMAGE } from "./opencode";
@@ -75,6 +80,22 @@ export interface PlaceOptions {
   capacity?: number | null;
   /** JSON Schema for typed tokens (colored Petri nets) */
   tokenSchema?: Record<string, unknown>;
+  /**
+   * Arbitrary key-value annotations attached to this place.
+   *
+   * Used by Sherpa and other consumers to attach metadata directly to
+   * the place definition — tool availability, prompt keys, HITL flags,
+   * or any other consumer-specific metadata.
+   *
+   * @example
+   * // Sherpa workflow annotations
+   * annotations: {
+   *   "sherpa.tools":  "read_only",  // "none" | "read_only" | "read_and_todo" | "all" | "read_and_write"
+   *   "sherpa.prompt": "casing",     // prompt key looked up in the engine's prompt registry
+   *   "sherpa.hitl":   "false",      // "true" = LLM paused, waiting for human input
+   * }
+   */
+  annotations?: Record<string, string>;
 }
 
 /**
@@ -86,6 +107,7 @@ export class WorkflowBuilder {
     name: string;
     namespace: string;
     metadata?: Metadata;
+    engine?: EngineConfig;
     places: Place[];
     transitions: Transition[];
   };
@@ -98,6 +120,49 @@ export class WorkflowBuilder {
       places: [],
       transitions: [],
     };
+  }
+
+  /**
+   * Set the default engine configuration for all transitions.
+   * Individual transitions can override this.
+   *
+   * @example
+   * ```ts
+   * workflow('my-pipeline')
+   *   .engine('auto', { memoryGb: 8 })
+   *   // ... transitions inherit this config
+   * ```
+   */
+  engine(mode: EngineMode, requirements?: Partial<EngineRequirements>): this {
+    this._workflow.engine = {
+      mode,
+      requirements: requirements as EngineRequirements,
+    };
+    return this;
+  }
+
+  /**
+   * Configure for local-only execution (development mode).
+   * Uses local Dagger installation, no cloud fallback.
+   */
+  localOnly(): this {
+    return this.engine("local");
+  }
+
+  /**
+   * Configure for cloud-only execution (production mode).
+   * All transitions run via Engine Service with audit trail.
+   */
+  cloudOnly(requirements?: Partial<EngineRequirements>): this {
+    return this.engine("cloud", { requireAudit: true, ...requirements });
+  }
+
+  /**
+   * Configure for auto mode with GPU requirement.
+   * Forces cloud execution for GPU workloads.
+   */
+  withGpu(memoryGb?: number): this {
+    return this.engine("auto", { gpu: true, memoryGb });
   }
 
   /**
@@ -153,6 +218,7 @@ export class WorkflowBuilder {
       initialTokens: options.initialTokens ?? 0,
       capacity: options.capacity ?? null,
       tokenSchema: options.tokenSchema,
+      annotations: options.annotations,
     });
     return this;
   }
@@ -228,11 +294,14 @@ export class TransitionBuilder {
     outputs: Arc[];
     guard?: string;
     action?: Action;
+    policy?: PolicyGate;
     resources?: Resources;
+    engine?: EngineConfig;
     timeout: string;
     retries: number;
     retryBackoff: "fixed" | "exponential";
     priority: number;
+    annotations?: Record<string, string>;
   };
 
   constructor(
@@ -248,6 +317,30 @@ export class TransitionBuilder {
       retryBackoff: "exponential",
       priority: 50,
     };
+  }
+
+  /**
+   * Attach arbitrary key-value annotations to this transition.
+   *
+   * Used by Sherpa to describe HITL actions to the frontend:
+   *   - `sherpa.label`   — human-readable button label (e.g. "Accept plan")
+   *   - `sherpa.variant` — button style: "primary" | "danger" | "ghost"
+   *
+   * Other consumers can use any keys they need.
+   *
+   * @example
+   * .transition("accept")
+   *   .from("human_gate").to("executing")
+   *   .annotate({ "sherpa.label": "Accept plan", "sherpa.variant": "primary" })
+   *   .noop()
+   *   .done()
+   */
+  annotate(annotations: Record<string, string>): this {
+    this._transition.annotations = {
+      ...this._transition.annotations,
+      ...annotations,
+    };
+    return this;
   }
 
   /**
@@ -504,6 +597,55 @@ export class TransitionBuilder {
   }
 
   /**
+   * Add a policy gate to validate action outputs.
+   * Runs conftest with the specified policies against the action's output.
+   *
+   * Policy is a special Dagger mini-pipeline that runs conftest/OPA
+   * to validate the outputs from the previous dagger step.
+   *
+   * @param path - Path to policy directory containing .rego files
+   * @param options - Optional policy configuration
+   *
+   * @example
+   * // Simple usage - validate trivy scan results
+   * .transition('security-scan')
+   *   .from('source').to('scanned')
+   *   .dagger('./pipelines/trivy', 'scan')
+   *   .policy('./policies/security')
+   *   .done()
+   *
+   * @example
+   * // With custom query
+   * .transition('coverage-check')
+   *   .from('source').to('covered')
+   *   .dagger('./pipelines/coverage', 'run')
+   *   .policy('./policies/coverage', {
+   *     query: 'data.coverage.allow',
+   *     input: 'coverage.json',
+   *   })
+   *   .done()
+   */
+  policy(
+    path: string,
+    options?: {
+      /** Rego query to evaluate (default: 'data.main.deny') */
+      query?: string;
+      /** Input file pattern from action outputs (default: '*.json') */
+      input?: string;
+      /** Fail-open behavior - allow on error (default: false) */
+      failOpen?: boolean;
+    },
+  ): this {
+    this._transition.policy = {
+      path,
+      query: options?.query ?? "data.main.deny",
+      input: options?.input ?? "*.json",
+      failOpen: options?.failOpen ?? false,
+    };
+    return this;
+  }
+
+  /**
    * Set resource requirements for execution.
    */
   resources(resources: Resources): this {
@@ -568,6 +710,55 @@ export class TransitionBuilder {
   priority(priority: number): this {
     this._transition.priority = priority;
     return this;
+  }
+
+  /**
+   * Set engine configuration for this transition (overrides workflow default).
+   *
+   * @param mode - Engine mode: 'local', 'cloud', or 'auto'
+   * @param requirements - Optional resource requirements
+   *
+   * @example
+   * ```ts
+   * .transition('deploy')
+   *   .engine('cloud', { requireAudit: true })
+   *   .dagger('./ci', 'deploy')
+   * ```
+   */
+  engine(mode: EngineMode, requirements?: Partial<EngineRequirements>): this {
+    this._transition.engine = {
+      mode,
+      requirements: requirements as EngineRequirements,
+    };
+    return this;
+  }
+
+  /**
+   * Force local execution for this transition.
+   */
+  local(): this {
+    return this.engine("local");
+  }
+
+  /**
+   * Force cloud execution for this transition.
+   */
+  cloud(requirements?: Partial<EngineRequirements>): this {
+    return this.engine("cloud", requirements);
+  }
+
+  /**
+   * Require GPU for this transition (forces cloud execution).
+   */
+  gpu(memoryGb?: number): this {
+    return this.engine("auto", { gpu: true, memoryGb });
+  }
+
+  /**
+   * Require audit trail for this transition (forces cloud execution).
+   */
+  audit(): this {
+    return this.engine("cloud", { requireAudit: true });
   }
 
   /**

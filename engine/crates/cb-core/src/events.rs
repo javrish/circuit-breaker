@@ -43,6 +43,10 @@ pub enum EventType {
     TokenProduced,
     #[serde(rename = "token.consumed")]
     TokenConsumed,
+    #[serde(rename = "token.injected")]
+    TokenInjected,
+    #[serde(rename = "token.updated")]
+    TokenUpdated,
 
     // Task events
     #[serde(rename = "task.dispatched")]
@@ -70,6 +74,8 @@ impl EventType {
             Self::TransitionRetrying => "transition.retrying",
             Self::TokenProduced => "token.produced",
             Self::TokenConsumed => "token.consumed",
+            Self::TokenInjected => "token.injected",
+            Self::TokenUpdated => "token.updated",
             Self::TaskDispatched => "task.dispatched",
             Self::TaskCompleted => "task.completed",
             Self::TaskFailed => "task.failed",
@@ -105,7 +111,7 @@ impl EventType {
     /// Check if this is a token event.
     #[must_use]
     pub fn is_token_event(&self) -> bool {
-        matches!(self, Self::TokenProduced | Self::TokenConsumed)
+        matches!(self, Self::TokenProduced | Self::TokenConsumed | Self::TokenInjected | Self::TokenUpdated)
     }
 
     /// Check if this is a task event.
@@ -512,6 +518,23 @@ pub struct TokenInjectedPayload {
     pub reason: Option<String>,
 }
 
+/// Payload for token.updated event (gate pattern - update token data to satisfy guards).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUpdatedPayload {
+    pub run_ref: RunRef,
+    pub token: TokenData,
+    pub place_id: String,
+    /// Previous token data (for audit trail)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_data: Option<serde_json::Value>,
+    /// Who/what updated the token
+    pub updated_by: String,
+    /// Reason for update (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Payload for task.dispatched event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -642,6 +665,7 @@ pub type TransitionRetryingEvent = Event<TransitionRetryingPayload>;
 pub type TokenProducedEvent = Event<TokenProducedPayload>;
 pub type TokenConsumedEvent = Event<TokenConsumedPayload>;
 pub type TokenInjectedEvent = Event<TokenInjectedPayload>;
+pub type TokenUpdatedEvent = Event<TokenUpdatedPayload>;
 
 pub type TaskDispatchedEvent = Event<TaskDispatchedPayload>;
 pub type TaskCompletedEvent = Event<TaskCompletedPayload>;

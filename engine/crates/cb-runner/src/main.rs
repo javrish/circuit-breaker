@@ -76,6 +76,8 @@ struct TaskDispatchMessage {
     environment: HashMap<String, String>,
     #[serde(default)]
     input_tokens: Vec<TokenData>,
+    #[serde(default)]
+    policy: Option<cb_core::workflow::PolicyGate>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -136,7 +138,7 @@ impl Runner {
 
         // Parse and execute the action
         let start = std::time::Instant::now();
-        let result = self.execute_action(&msg).await;
+        let result = self.execute_action(&msg, &transition_ref).await;
         let duration = start.elapsed();
 
         match result {
@@ -172,21 +174,22 @@ impl Runner {
     async fn execute_action(
         &self,
         msg: &TaskDispatchMessage,
+        transition_ref: &TransitionRef,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         // Parse the action from JSON
         let action: Action = serde_json::from_value(msg.action.clone())?;
 
         match action {
             Action::Dagger(dagger_action) => {
-                self.execute_dagger(&dagger_action, &msg.environment).await
+                self.execute_dagger(&dagger_action, &msg.environment, &msg.input_tokens).await
             }
             Action::Http(http_action) => self.execute_http(&http_action).await,
             Action::Script(script_action) => {
-                self.execute_script(&script_action, &msg.environment).await
+                self.execute_script(&script_action, &msg.environment, transition_ref, &msg.input_tokens).await
             }
             Action::Noop => {
                 debug!("Executing noop action");
-                Ok(serde_json::json!({"status": "noop"}))
+                Ok(serde_json::json!({"status": "done", "message": "Workflow completed successfully"}))
             }
         }
     }
@@ -196,13 +199,25 @@ impl Runner {
         &self,
         action: &DaggerAction,
         env: &HashMap<String, String>,
+        input_tokens: &[TokenData],
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         info!(
             module = %action.module,
             function = ?action.function,
             image = ?action.image,
+            input_tokens_count = %input_tokens.len(),
             "Executing Dagger action"
         );
+
+        // Debug: log token data
+        for (i, token) in input_tokens.iter().enumerate() {
+            debug!(
+                token_index = %i,
+                token_id = ?token.token_id,
+                token_data = ?token.data,
+                "Input token"
+            );
+        }
 
         // Check if this is an OpenCode task (has image and args with command)
         if let Some(ref image) = action.image {
@@ -221,14 +236,57 @@ impl Runner {
             cmd.arg(func);
         }
 
-        // Add arguments
+        // Add arguments with token interpolation
         if let Some(ref args) = action.args {
+            // Build token data map from input tokens
+            let token_data: HashMap<String, serde_json::Value> = input_tokens
+                .iter()
+                .filter_map(|t| t.data.clone())
+                .flat_map(|data| {
+                    if let serde_json::Value::Object(map) = data {
+                        map.into_iter().collect::<Vec<_>>()
+                    } else {
+                        vec![]
+                    }
+                })
+                .collect();
+
+            info!(
+                token_data_keys = ?token_data.keys().collect::<Vec<_>>(),
+                "Token data map built"
+            );
+
             for (key, value) in args {
-                let value_str = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => value.to_string(),
+                let resolved_value: Option<String> = match value {
+                    serde_json::Value::String(s) => {
+                        // Resolve ctx.token.* references
+                        if s.starts_with("ctx.token.") {
+                            let token_key = s.strip_prefix("ctx.token.").unwrap();
+                            if let Some(v) = token_data.get(token_key) {
+                                match v {
+                                    serde_json::Value::String(sv) => Some(sv.clone()),
+                                    serde_json::Value::Null => None,
+                                    other => Some(other.to_string()),
+                                }
+                            } else {
+                                debug!(key = %token_key, "Token key not found, skipping arg");
+                                None
+                            }
+                        } else {
+                            Some(s.clone())
+                        }
+                    }
+                    serde_json::Value::Null => None,
+                    other => Some(other.to_string()),
                 };
-                cmd.arg(format!("--{}={}", key, value_str));
+
+                // Only add arg if we have a resolved value
+                if let Some(ref val) = resolved_value {
+                    info!(key = %key, value = %val, "Adding resolved arg");
+                    cmd.arg(format!("--{}={}", key, val));
+                } else {
+                    debug!(key = %key, "Skipping arg with no resolved value");
+                }
             }
         }
 
@@ -259,11 +317,24 @@ impl Runner {
         let output = cmd.output().await?;
 
         if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            Ok(serde_json::json!({
-                "status": "success",
-                "output": stdout.to_string(),
-            }))
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+            // Try to parse the output as JSON - if it is, use it directly as token data
+            // This allows dagger modules to return structured data that flows to the next transition
+            match serde_json::from_str::<serde_json::Value>(&stdout) {
+                Ok(json_output) => {
+                    debug!("Dagger output parsed as JSON");
+                    Ok(json_output)
+                }
+                Err(_) => {
+                    // Not JSON, wrap in a standard format
+                    debug!("Dagger output is not JSON, wrapping as string");
+                    Ok(serde_json::json!({
+                        "status": "success",
+                        "output": stdout,
+                    }))
+                }
+            }
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(format!("Dagger execution failed: {}", stderr).into())
@@ -521,6 +592,8 @@ impl Runner {
         &self,
         action: &ScriptAction,
         env: &HashMap<String, String>,
+        transition_ref: &TransitionRef,
+        input_tokens: &[TokenData],
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         info!(runtime = ?action.runtime, "Executing script action");
 
@@ -537,17 +610,51 @@ impl Runner {
             cmd.env(key, value);
         }
 
+        // Build ctx object from input tokens
+        // Merge all token data into a single ctx object
+        let mut ctx = serde_json::Map::new();
+        for token in input_tokens {
+            if let Some(data) = &token.data {
+                if let Some(obj) = data.as_object() {
+                    for (k, v) in obj {
+                        ctx.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        let ctx_json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
+
+        // Preamble that injects the publish() function and ctx
+        let preamble = format!(
+            r#"
+globalThis.publish = (message, level = 'info') => {{
+    console.log(JSON.stringify({{ __cb_publish: true, level, message, timestamp: new Date().toISOString() }}));
+}};
+globalThis.log = globalThis.publish;
+globalThis.ctx = {};
+"#,
+            ctx_json
+        );
+
         if let Some(ref code) = action.code {
+            // Wrap user code in an async IIFE so return statements work
+            let wrapped_code = format!(
+                "{}\n(async () => {{\n{}\n}})().then(r => r !== undefined && console.log(JSON.stringify({{ __cb_result: true, value: r }})));",
+                preamble,
+                code
+            );
+
             // Run inline code
             match action.runtime {
                 cb_core::workflow::ScriptRuntime::Bun => {
-                    cmd.arg("eval").arg(code);
+                    // Bun uses -e for inline evaluation
+                    cmd.arg("-e").arg(&wrapped_code);
                 }
                 cb_core::workflow::ScriptRuntime::Deno => {
-                    cmd.arg("eval").arg(code);
+                    cmd.arg("eval").arg(&wrapped_code);
                 }
                 cb_core::workflow::ScriptRuntime::Node => {
-                    cmd.arg("-e").arg(code);
+                    cmd.arg("-e").arg(&wrapped_code);
                 }
             }
         } else if let Some(ref file) = action.file {
@@ -560,10 +667,76 @@ impl Runner {
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            Ok(serde_json::json!({
+
+            // Parse stdout for publish() calls and forward to NATS
+            let mut regular_output = Vec::new();
+            let mut published_messages: Vec<serde_json::Value> = Vec::new();
+            let mut script_result: Option<serde_json::Value> = None;
+
+            for line in stdout.lines() {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
+                    if parsed.get("__cb_publish").is_some() {
+                        // This is a publish() call - forward to NATS and collect for output
+                        let message = parsed.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                        let level = parsed.get("level").and_then(|l| l.as_str()).unwrap_or("info");
+                        let timestamp = parsed.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+
+                        // Collect for output
+                        published_messages.push(serde_json::json!({
+                            "level": level,
+                            "message": message,
+                            "timestamp": timestamp,
+                        }));
+
+                        // Publish to NATS log stream
+                        let log_payload = serde_json::json!({
+                            "transitionRef": transition_ref,
+                            "level": level,
+                            "message": message,
+                            "timestamp": timestamp,
+                        });
+
+                        let subject = format!(
+                            "cb.runs.{}.logs.{}",
+                            transition_ref.run_id, transition_ref.transition_id
+                        );
+
+                        if let Err(e) = self.nats.publish_jetstream(&subject, &log_payload).await {
+                            warn!(error = %e, "Failed to publish script log to NATS");
+                        }
+                    } else if parsed.get("__cb_result").is_some() {
+                        // This is the script's return value
+                        script_result = parsed.get("value").cloned();
+                    } else {
+                        regular_output.push(line.to_string());
+                    }
+                } else {
+                    regular_output.push(line.to_string());
+                }
+            }
+
+            // Build output with published messages included
+            let mut result = serde_json::json!({
                 "status": "success",
-                "output": stdout.to_string(),
-            }))
+            });
+
+            // Include published messages if any
+            if !published_messages.is_empty() {
+                result["logs"] = serde_json::json!(published_messages);
+            }
+
+            // Include regular stdout if any
+            let stdout_str = regular_output.join("\n");
+            if !stdout_str.is_empty() {
+                result["output"] = serde_json::json!(stdout_str);
+            }
+
+            // Include script return value if any
+            if let Some(value) = script_result {
+                result["result"] = value;
+            }
+
+            Ok(result)
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(format!("Script execution failed: {}", stderr).into())

@@ -17,7 +17,7 @@ struct Args {
     host: IpAddr,
 
     /// Port to listen on
-    #[arg(short, long, env = "CB_API_PORT", default_value_t = 8080)]
+    #[arg(short, long, env = "CB_API_PORT", default_value_t = 9000)]
     port: u16,
 
     /// NATS server URL

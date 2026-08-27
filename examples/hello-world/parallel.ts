@@ -24,43 +24,45 @@
  *   •            = Initial token
  */
 
-import { workflow } from '@circuit-breaker/core';
+import { workflow } from "@circuit-breaker/core";
 
-const parallelWorkflow = workflow('parallel-example')
-  .namespace('examples')
-  .description('Demonstrates parallel execution with fork/join synchronization')
+const parallelWorkflow = workflow("parallel-example")
+  .namespace("examples")
+  .description("Demonstrates parallel execution with fork/join synchronization")
   .labels({
-    example: 'true',
-    complexity: 'intermediate',
-    pattern: 'fork-join',
+    example: "true",
+    complexity: "intermediate",
+    pattern: "fork-join",
   })
 
   // ============ Places (States) ============
 
   // Starting state
-  .place('start', { initialTokens: 1 })
+  .place("start", { initialTokens: 1 })
 
   // Parallel branch results (one place per branch)
-  .place('task-a-done')
-  .place('task-b-done')
-  .place('task-c-done')
+  .place("task-a-done")
+  .place("task-b-done")
+  .place("task-c-done")
 
   // Final state after synchronization
-  .place('complete')
+  .place("complete")
 
   // ============ Transitions (Actions) ============
 
   // Fork: single input, multiple outputs (AND-split)
   // When this fires, it produces a token in EACH output place
-  .transition('fork')
-    .from('start')
-    .to('task-a-done', 'task-b-done', 'task-c-done')
-    .script(`
-      console.log('Forking into parallel tasks...');
+  .transition("fork")
+  .from("start")
+  .to("task-a-done", "task-b-done", "task-c-done")
+  .script(
+    `
+      publish('Forking into parallel tasks...');
       return { forkedAt: new Date().toISOString() };
-    `)
-    .timeout('30s')
-    .done()
+    `,
+  )
+  .timeout("30s")
+  .done()
 
   // Note: In a real workflow, you'd have separate transitions for each branch:
   //
@@ -74,18 +76,20 @@ const parallelWorkflow = workflow('parallel-example')
 
   // Join: multiple inputs, single output (AND-join)
   // This transition ONLY fires when ALL input places have tokens
-  .transition('join')
-    .from('task-a-done', 'task-b-done', 'task-c-done')
-    .to('complete')
-    .script(`
-      console.log('All parallel tasks complete! Joining...');
+  .transition("join")
+  .from("task-a-done", "task-b-done", "task-c-done")
+  .to("complete")
+  .script(
+    `
+      publish('All parallel tasks complete! Joining...');
       return {
         joinedAt: new Date().toISOString(),
         message: 'All branches synchronized successfully'
       };
-    `)
-    .timeout('30s')
-    .done()
+    `,
+  )
+  .timeout("30s")
+  .done()
 
   .build();
 
