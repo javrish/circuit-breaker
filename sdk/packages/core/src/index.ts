@@ -20,6 +20,7 @@ export {
   NoopActionSchema,
   ActionSchema,
   MetadataSchema,
+  PolicyGateSchema,
 } from "./schema";
 
 // Type exports
@@ -36,6 +37,7 @@ export type {
   Action,
   Metadata,
   TokenSchema,
+  PolicyGate,
 } from "./schema";
 
 // Builder exports

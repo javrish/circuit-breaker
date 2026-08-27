@@ -23,6 +23,7 @@ import {
 import logs from "./commands/logs";
 import inject from "./commands/inject";
 import describe from "./commands/describe";
+import { startTUI } from "./tui";
 
 const VERSION = "0.1.0";
 
@@ -67,7 +68,7 @@ const program = new Command()
   .option(
     "--api-url <url>",
     "Circuit Breaker API URL",
-    process.env.CIRCUIT_BREAKER_API ?? "http://localhost:8080",
+    process.env.CIRCUIT_BREAKER_API ?? "http://localhost:9000",
   )
   .option(
     "--api-key <key>",
@@ -403,6 +404,177 @@ program
   .option("--json", "Output as JSON")
   .action(describe);
 
+// Dev command - starts all services and launches TUI
+program
+  .command("dev")
+  .description(
+    "Start all services (NATS, API, Runner) and launch the interactive TUI",
+  )
+  .option("--nats-url <url>", "NATS server URL", "nats://localhost:4222")
+  .option("--api-port <port>", "API server port", "9000")
+  .option("--skip-nats", "Skip starting NATS (use existing instance)")
+  .action(
+    async (
+      options: { natsUrl: string; apiPort: string; skipNats?: boolean },
+      cmd: Command,
+    ) => {
+      const globalOpts = cmd.optsWithGlobals();
+      const processes: Array<{
+        name: string;
+        proc: ReturnType<typeof Bun.spawn>;
+      }> = [];
+
+      // Find the engine directory (relative to the CLI package)
+      const { resolve, dirname } = await import("path");
+      const cliDir = dirname(new URL(import.meta.url).pathname);
+      const engineDir = resolve(cliDir, "../../../../engine");
+      const binDir = resolve(engineDir, "target/debug");
+
+      console.log(
+        chalk.bold("\n🚀 Starting Circuit Breaker Dev Environment\n"),
+      );
+
+      // Check if binaries exist
+      const apiPath = resolve(binDir, "cb-api");
+      const runnerPath = resolve(binDir, "cb-runner");
+      const controllerPath = resolve(binDir, "cb-controller");
+
+      const apiExists = await Bun.file(apiPath).exists();
+      const runnerExists = await Bun.file(runnerPath).exists();
+      const controllerExists = await Bun.file(controllerPath).exists();
+
+      if (!apiExists || !runnerExists || !controllerExists) {
+        console.log(chalk.yellow("⚠ Rust binaries not found. Building..."));
+        console.log(chalk.dim(`  Engine directory: ${engineDir}`));
+
+        const buildProc = Bun.spawn(
+          [
+            "cargo",
+            "build",
+            "--bin",
+            "cb-api",
+            "--bin",
+            "cb-runner",
+            "--bin",
+            "cb-controller",
+          ],
+          {
+            cwd: engineDir,
+            stdout: "inherit",
+            stderr: "inherit",
+          },
+        );
+
+        const exitCode = await buildProc.exited;
+        if (exitCode !== 0) {
+          console.error(chalk.red("✗ Failed to build Rust binaries"));
+          process.exit(1);
+        }
+        console.log(chalk.green("✓ Build complete\n"));
+      }
+
+      // Cleanup function
+      const cleanup = () => {
+        console.log(chalk.dim("\n\nShutting down services..."));
+        for (const { name, proc } of processes) {
+          console.log(chalk.dim(`  Stopping ${name}...`));
+          proc.kill();
+        }
+        process.exit(0);
+      };
+
+      process.on("SIGINT", cleanup);
+      process.on("SIGTERM", cleanup);
+
+      // Check if NATS is running
+      if (!options.skipNats) {
+        try {
+          const nc = await import("nats").then((m) =>
+            m.connect({ servers: options.natsUrl, timeout: 1000 }),
+          );
+          await nc.close();
+          console.log(chalk.green("✓ NATS already running"));
+        } catch {
+          console.log(chalk.yellow("⚠ NATS not running at " + options.natsUrl));
+          console.log(chalk.dim("  Starting NATS server..."));
+
+          // Try to start NATS
+          try {
+            const natsProc = Bun.spawn(["nats-server", "-js"], {
+              stdout: "pipe",
+              stderr: "pipe",
+            });
+            processes.push({ name: "nats-server", proc: natsProc });
+
+            // Wait a moment for NATS to start
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            console.log(chalk.green("✓ NATS server started"));
+          } catch {
+            console.error(
+              chalk.red(
+                "✗ Failed to start NATS. Please install nats-server or start it manually.",
+              ),
+            );
+            console.log(chalk.dim("  brew install nats-server"));
+            cleanup();
+            process.exit(1);
+          }
+        }
+      }
+
+      // Start cb-api
+      console.log(chalk.dim("  Starting API server..."));
+      const apiProc = Bun.spawn([apiPath, "--port", options.apiPort], {
+        env: { ...process.env, NATS_URL: options.natsUrl },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      processes.push({ name: "cb-api", proc: apiProc });
+
+      // Wait for API to be ready
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      console.log(
+        chalk.green(`✓ API server started on port ${options.apiPort}`),
+      );
+
+      // Start cb-controller
+      console.log(chalk.dim("  Starting controller..."));
+      const controllerProc = Bun.spawn([controllerPath], {
+        env: { ...process.env, NATS_URL: options.natsUrl },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      processes.push({ name: "cb-controller", proc: controllerProc });
+
+      // Wait for controller to be ready
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      console.log(chalk.green("✓ Controller started"));
+
+      // Start cb-runner
+      console.log(chalk.dim("  Starting runner..."));
+      const runnerProc = Bun.spawn([runnerPath], {
+        env: { ...process.env, NATS_URL: options.natsUrl },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      processes.push({ name: "cb-runner", proc: runnerProc });
+
+      // Wait for runner to be ready
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      console.log(chalk.green("✓ Runner started"));
+
+      console.log(chalk.bold.green("\n✓ All services running!\n"));
+      console.log(chalk.dim("Press Ctrl+C to stop all services\n"));
+
+      // Launch TUI
+      startTUI({
+        apiUrl: `http://localhost:${options.apiPort}`,
+        apiKey: globalOpts.apiKey,
+        natsUrl: options.natsUrl,
+      });
+    },
+  );
+
 // Health command
 program
   .command("health")
@@ -429,5 +601,24 @@ program
     }
   });
 
-// Parse and run
-program.parse(process.argv);
+// Check if no command was provided - launch interactive TUI
+const args = process.argv.slice(2);
+
+// Check for help/version flags that should be handled by commander
+const helpFlags = ["-h", "--help", "-V", "--version"];
+const hasHelpFlag = args.some((arg) => helpFlags.includes(arg));
+
+// Check if there's a command (not a flag)
+const hasCommand = args.length > 0 && !args[0].startsWith("-");
+
+if (args.length === 0) {
+  // Launch interactive TUI when just running `cb` with no arguments
+  startTUI({
+    apiUrl: process.env.CIRCUIT_BREAKER_API || "http://localhost:9000",
+    apiKey: process.env.CIRCUIT_BREAKER_API_KEY,
+    natsUrl: process.env.NATS_URL || "nats://localhost:4222",
+  });
+} else {
+  // Parse and run traditional CLI commands (including --help, etc.)
+  program.parse(process.argv);
+}

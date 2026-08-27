@@ -64,8 +64,7 @@ const helloWorld = {
         type: "script" as const,
         runtime: "bun" as const,
         code: `
-          console.log('Hello');
-          return { message: 'Hello' };
+          publish('Hello');
         `,
       },
       timeout: "1m",
@@ -82,8 +81,7 @@ const helloWorld = {
         type: "script" as const,
         runtime: "bun" as const,
         code: `
-          console.log('World!');
-          return { message: 'World!' };
+          publish('World!');
         `,
       },
       timeout: "1m",
