@@ -111,6 +111,44 @@ export interface ListRunsResponse {
 }
 
 /**
+ * Log entry for a workflow run.
+ */
+export interface LogEntry {
+  timestamp: string;
+  level: string;
+  message: string;
+  transitionId?: string;
+  data?: Record<string, unknown>;
+}
+
+/**
+ * Get logs response.
+ */
+export interface GetLogsResponse {
+  runId: string;
+  logs: LogEntry[];
+}
+
+/**
+ * Place state in a workflow run.
+ */
+export interface PlaceState {
+  id: string;
+  name?: string;
+  tokens: number;
+  tokenData?: unknown[];
+  tokenSchema?: Record<string, unknown>;
+}
+
+/**
+ * Get places response.
+ */
+export interface GetPlacesResponse {
+  runId: string;
+  places: PlaceState[];
+}
+
+/**
  * API error response.
  */
 export class ApiError extends Error {
@@ -362,6 +400,63 @@ export class CircuitBreakerClient {
     return this.request<RunWorkflowResponse>(
       "POST",
       `/api/v1/runs/${runId}/retry`,
+    );
+  }
+
+  /**
+   * Get logs for a workflow run.
+   */
+  async getLogs(runId: string): Promise<GetLogsResponse> {
+    return this.request<GetLogsResponse>("GET", `/api/v1/runs/${runId}/logs`);
+  }
+
+  /**
+   * Inject a token into a place in a running workflow.
+   */
+  async injectToken(
+    runId: string,
+    placeId: string,
+    options: { data?: unknown; reason?: string } = {},
+  ): Promise<void> {
+    return this.request<void>("POST", `/api/v1/runs/${runId}/inject`, {
+      placeId,
+      data: options.data,
+      reason: options.reason,
+    });
+  }
+
+  /**
+   * Resume a workflow by updating token data to satisfy a failed guard.
+   * If no tokens exist in the place, injects one. If tokens exist, updates their data.
+   * After updating, guards are re-evaluated and transitions may fire.
+   */
+  async resume(
+    runId: string,
+    placeId: string,
+    data: unknown,
+    options: { reason?: string } = {},
+  ): Promise<{
+    runId: string;
+    placeId: string;
+    tokenCount: number;
+    injected: boolean;
+    enabledTransitions: string[];
+    waitingTransitions: string[];
+  }> {
+    return this.request("POST", `/api/v1/runs/${runId}/resume`, {
+      placeId,
+      data,
+      reason: options.reason,
+    });
+  }
+
+  /**
+   * Get places and their current token state for a run.
+   */
+  async getPlaces(runId: string): Promise<GetPlacesResponse> {
+    return this.request<GetPlacesResponse>(
+      "GET",
+      `/api/v1/runs/${runId}/places`,
     );
   }
 

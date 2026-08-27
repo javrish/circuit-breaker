@@ -409,12 +409,14 @@ mod tests {
                     initial_tokens: 1,
                     capacity: None,
                     token_schema: None,
+                    annotations: Default::default(),
                 },
                 workflow::Place {
                     id: "p2".to_string(),
                     initial_tokens: 0,
                     capacity: None,
                     token_schema: None,
+                    annotations: Default::default(),
                 },
             ],
             transitions: vec![workflow::Transition {
@@ -431,11 +433,13 @@ mod tests {
                 }],
                 guard: None,
                 action: Action::Noop,
+                policy: None,
                 resources: None,
                 timeout: "5m".to_string(),
                 retries: 0,
                 retry_backoff: workflow::RetryBackoff::Exponential,
                 priority: 50,
+                annotations: Default::default(),
             }],
         }
     }
