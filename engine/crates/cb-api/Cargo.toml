@@ -53,6 +53,9 @@ clap = { workspace = true }
 # Validation
 jsonschema = { workspace = true }
 
+# CEL expression evaluation for guards
+cel-interpreter = { workspace = true }
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 wiremock = { workspace = true }

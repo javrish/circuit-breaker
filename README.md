@@ -155,11 +155,11 @@ cd engine && cargo run --bin cb-api
 
 You should see:
 ```
-INFO cb_api: Starting Circuit Breaker API server host=0.0.0.0 port=8080
+INFO cb_api: Starting Circuit Breaker API server host=0.0.0.0 port=9000
 INFO cb_api: Connected to NATS at nats://localhost:4222
 INFO cb_api: RUNS stream ready
 INFO cb_api: WORKFLOWS stream ready
-INFO cb_api: API server listening on 0.0.0.0:8080
+INFO cb_api: API server listening on 0.0.0.0:9000
 ```
 
 ### 4. Start the Runner
@@ -415,7 +415,7 @@ export ANTHROPIC_API_KEY="your-key"
 # Returns: Workflow ID: abc123
 
 # Create a run without auto-start
-curl -X POST http://localhost:8080/api/v1/workflows/abc123/runs
+curl -X POST http://localhost:9000/api/v1/workflows/abc123/runs
 
 # Inject token to trigger specific transition
 ./cb inject <run-id> start --reason "Manual test"
@@ -467,7 +467,7 @@ Terminal 4 - CLI:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `NATS_URL` | NATS server URL | `nats://localhost:4222` |
-| `CB_API_PORT` | API server port | `8080` |
+| `CB_API_PORT` | API server port | `9000` |
 | `CB_RUNNER_POOL` | Runner pool name | `default` |
 | `ANTHROPIC_API_KEY` | Anthropic API key | - |
 | `OPENAI_API_KEY` | OpenAI API key | - |

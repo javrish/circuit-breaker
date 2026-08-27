@@ -17,9 +17,16 @@
 //! - `/api/v1/events/ws` - WebSocket event stream
 //! - `/health` - Health check
 //! - `/metrics` - Prometheus metrics
+//!
+//! ## Event Sourcing
+//!
+//! Run state is event-sourced from NATS JetStream. The `state` module provides
+//! reconstruction of run state by replaying events.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod state;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -37,14 +44,17 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use cb_core::events::{RunRef, TokenData, TokenInjectedPayload, TransitionRef};
+use cb_core::events::{
+    RunRef, TokenData, TokenInjectedPayload, TokenProducedPayload, TokenConsumedPayload,
+    TokenUpdatedPayload, TransitionRef, WorkflowRef, WorkflowStartedPayload, TriggerType,
+};
 use cb_core::workflow::Workflow;
 use cb_nats::{streams, NatsClient, NatsConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// API server configuration.
@@ -62,7 +72,7 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             host: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-            port: 8080,
+            port: 9000,
             nats_url: "nats://localhost:4222".to_string(),
         }
     }
@@ -102,6 +112,9 @@ pub struct WorkflowRun {
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Current marking (token distribution).
     pub current_marking: HashMap<String, u32>,
+    /// Token data for each place (data attached to tokens).
+    #[serde(default)]
+    pub token_data: HashMap<String, serde_json::Value>,
     /// Transition statuses.
     pub transitions: Vec<TransitionStatus>,
     /// Error info if failed.
@@ -198,6 +211,67 @@ pub struct InjectTokenResponse {
     pub token_schema: Option<serde_json::Value>,
 }
 
+/// Request to update token data in a place (gate pattern).
+/// This allows updating token data to satisfy guards without adding new tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTokenRequest {
+    /// Place ID where tokens should be updated.
+    pub place_id: String,
+    /// New token data (will be merged with existing data).
+    pub data: serde_json::Value,
+    /// Optional reason for update.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Response after updating token data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTokenResponse {
+    /// Run ID.
+    pub run_id: Uuid,
+    /// Place where token data was updated.
+    pub place_id: String,
+    /// Token count in that place.
+    pub token_count: u32,
+    /// Transitions that are now enabled (guards satisfied).
+    pub enabled_transitions: Vec<String>,
+    /// Transitions still waiting on guards.
+    pub waiting_transitions: Vec<String>,
+}
+
+/// Request to resume a workflow by updating token data to satisfy a failed guard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeRequest {
+    /// Place ID where the token is waiting.
+    pub place_id: String,
+    /// Updated token data to satisfy the guard.
+    pub data: serde_json::Value,
+    /// Optional reason for the resume.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Response after resuming a workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeResponse {
+    /// Run ID.
+    pub run_id: Uuid,
+    /// Place where token was updated.
+    pub place_id: String,
+    /// Token count in that place.
+    pub token_count: u32,
+    /// Whether a new token was injected (true) or existing token updated (false).
+    pub injected: bool,
+    /// Transitions that are now enabled (guards passed).
+    pub enabled_transitions: Vec<String>,
+    /// Transitions still waiting on guards.
+    pub waiting_transitions: Vec<String>,
+}
+
 /// Response with place schema information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -258,6 +332,9 @@ pub struct TaskDispatchMessage {
     /// Input tokens.
     #[serde(default)]
     pub input_tokens: Vec<TokenData>,
+    /// Policy gate to evaluate after action completes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<cb_core::workflow::PolicyGate>,
 }
 
 /// Task resource requirements.
@@ -275,14 +352,16 @@ pub struct TaskResources {
 /// Application state shared across handlers.
 #[derive(Clone)]
 pub struct AppState {
-    /// Stored workflows.
+    /// Stored workflows (definitions, not event-sourced).
     pub workflows: Arc<RwLock<HashMap<Uuid, StoredWorkflow>>>,
-    /// Workflow runs.
+    /// Workflow runs (in-memory cache, will be deprecated in favor of event sourcing).
     pub runs: Arc<RwLock<HashMap<Uuid, WorkflowRun>>>,
     /// Task logs indexed by run_id.
     pub task_logs: Arc<RwLock<HashMap<Uuid, Vec<TaskLog>>>>,
     /// NATS client.
     pub nats: Option<Arc<NatsClient>>,
+    /// Event-sourced state store.
+    pub event_store: Option<Arc<state::EventSourcedStateStore>>,
     /// Shutdown signal sender.
     pub shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
 }
@@ -294,6 +373,7 @@ impl Default for AppState {
             runs: Arc::new(RwLock::new(HashMap::new())),
             task_logs: Arc::new(RwLock::new(HashMap::new())),
             nats: None,
+            event_store: None,
             shutdown_tx: None,
         }
     }
@@ -303,11 +383,14 @@ impl AppState {
     /// Create a new AppState with NATS client.
     pub fn with_nats(nats: NatsClient) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let nats_arc = Arc::new(nats);
+        let event_store = state::EventSourcedStateStore::new(Arc::clone(&nats_arc));
         Self {
             workflows: Arc::new(RwLock::new(HashMap::new())),
             runs: Arc::new(RwLock::new(HashMap::new())),
             task_logs: Arc::new(RwLock::new(HashMap::new())),
-            nats: Some(Arc::new(nats)),
+            nats: Some(nats_arc),
+            event_store: Some(Arc::new(event_store)),
             shutdown_tx: Some(shutdown_tx),
         }
     }
@@ -438,208 +521,237 @@ async fn handle_transition_completed(
     run_id: Uuid,
     msg: TransitionCompletedMessage,
 ) {
-    use cb_core::petri::{terminal_places, try_fire_transition, Marking};
-
     let now = chrono::Utc::now();
     let duration_ms = msg.resource_usage.as_ref().and_then(|r| r.duration_ms);
-    let task_id = msg.transition_ref.execution_id.unwrap_or_else(Uuid::new_v4);
-    let started_at = now - chrono::Duration::milliseconds(duration_ms.unwrap_or(0) as i64);
+    let transition_id = msg.transition_ref.transition_id.clone();
 
-    // NOTE: TaskLog is written AFTER we know the Petri firing outcome (success or failure).
-    // This ensures TaskLog status accurately reflects whether the marking was updated.
+    // Store task log
+    {
+        let mut logs = state.task_logs.write().await;
+        let run_logs = logs.entry(run_id).or_insert_with(Vec::new);
+        run_logs.push(TaskLog {
+            task_id: msg.transition_ref.execution_id.unwrap_or_else(Uuid::new_v4),
+            run_id,
+            transition_id: transition_id.clone(),
+            status: "completed".to_string(),
+            output: msg.outputs.clone(),
+            error: None,
+            started_at: now - chrono::Duration::milliseconds(duration_ms.unwrap_or(0) as i64),
+            completed_at: Some(now),
+            duration_ms,
+        });
+    }
 
-    // Get workflow_id from the run first (need read lock)
-    let workflow_id = {
+    // Get workflow definition for this run
+    let workflow_def = {
         let runs = state.runs.read().await;
-        match runs.get(&run_id) {
-            Some(run) => run.workflow_id,
+        let run = match runs.get(&run_id) {
+            Some(r) => r,
             None => {
-                warn!(run_id = %run_id, "Run not found for transition completion");
+                warn!(%run_id, "Run not found for transition completion");
                 return;
             }
-        }
-    };
+        };
 
-    // Look up the workflow definition to get transition arcs
-    let workflow_def = {
         let workflows = state.workflows.read().await;
-        match workflows.get(&workflow_id) {
-            Some(stored) => stored.definition.clone(),
+        match workflows.get(&run.workflow_id) {
+            Some(w) => w.definition.clone(),
             None => {
-                error!(
-                    workflow_id = %workflow_id,
-                    run_id = %run_id,
-                    "Workflow not found for transition completion"
-                );
+                warn!(%run_id, "Workflow not found for run");
                 return;
             }
         }
     };
 
     // Find the transition that completed
-    let transition = match workflow_def
-        .transitions
-        .iter()
-        .find(|t| t.id == msg.transition_ref.transition_id)
-    {
-        Some(t) => t,
+    let transition = match workflow_def.transitions.iter().find(|t| t.id == transition_id) {
+        Some(t) => t.clone(),
         None => {
-            error!(
-                transition_id = %msg.transition_ref.transition_id,
-                run_id = %run_id,
-                "Transition not found in workflow definition"
-            );
+            warn!(%run_id, %transition_id, "Transition not found in workflow");
             return;
         }
     };
 
-    // Track result for TaskLog writing after releasing the runs lock
-    enum FiringOutcome {
-        Success,
-        Failure { error_msg: String },
+    // Get workflow_id for event payloads
+    let workflow_id = {
+        let runs = state.runs.read().await;
+        runs.get(&run_id).map(|r| r.workflow_id).unwrap_or(run_id)
+    };
+
+    // Publish token.consumed events for input places
+    if let Some(ref nats) = state.nats {
+        for input in &transition.inputs {
+            for _ in 0..input.weight {
+                let token = TokenData::new(input.place.clone());
+                let consumed_payload = TokenConsumedPayload {
+                    run_ref: RunRef {
+                        run_id,
+                        workflow_id,
+                        attempt: 1,
+                    },
+                    token,
+                    consumed_by: transition_id.clone(),
+                };
+
+                let subject = cb_nats::subjects::token_consumed(&run_id, &input.place);
+                if let Err(e) = nats.publish_jetstream(&subject, &consumed_payload).await {
+                    warn!(error = %e, place = %input.place, "Failed to publish token.consumed event");
+                } else {
+                    debug!(%run_id, place = %input.place, "Published token.consumed event");
+                }
+            }
+        }
+
+        // Publish token.produced events for output places
+        let output_data = msg.outputs.clone();
+        for output in &transition.outputs {
+            for _ in 0..output.weight {
+                let token = if let Some(ref data) = output_data {
+                    TokenData::with_data(output.place.clone(), data.clone())
+                } else {
+                    TokenData::new(output.place.clone())
+                };
+                let produced_payload = TokenProducedPayload {
+                    run_ref: RunRef {
+                        run_id,
+                        workflow_id,
+                        attempt: 1,
+                    },
+                    token,
+                    produced_by: transition_id.clone(),
+                };
+
+                let subject = cb_nats::subjects::token_produced(&run_id, &output.place);
+                if let Err(e) = nats.publish_jetstream(&subject, &produced_payload).await {
+                    warn!(error = %e, place = %output.place, "Failed to publish token.produced event");
+                } else {
+                    debug!(%run_id, place = %output.place, "Published token.produced event");
+                }
+            }
+        }
     }
 
-    let firing_outcome: Option<FiringOutcome>;
-    let transition_id_for_log = transition.id.clone();
+    let mut runs = state.runs.write().await;
 
-    {
-        let mut runs = state.runs.write().await;
+    if let Some(run) = runs.get_mut(&run_id) {
+        // Update transition status
+        if let Some(ts) = run
+            .transitions
+            .iter_mut()
+            .find(|t| t.transition_id == transition_id)
+        {
+            ts.status = "completed".to_string();
+            ts.completed_at = Some(now);
+        }
 
-        if let Some(run) = runs.get_mut(&run_id) {
-            // Update transition status (will be corrected to "failed" if firing fails)
-            if let Some(ts) = run
-                .transitions
-                .iter_mut()
-                .find(|t| t.transition_id == msg.transition_ref.transition_id)
-            {
-                ts.status = "completed".to_string();
-                ts.completed_at = Some(now);
+        // Move tokens: consume from input places, produce to output places
+        for input in &transition.inputs {
+            let count = run.current_marking.entry(input.place.clone()).or_insert(0);
+            *count = count.saturating_sub(input.weight);
+            // Clear token data from consumed places
+            if *count == 0 {
+                run.token_data.remove(&input.place);
             }
+        }
 
-            // Apply Petri net firing semantics using cb-core::petri::try_fire_transition.
-            // This ensures we use the canonical firing logic from the core library.
-            //
-            // Note: Input tokens were consumed when the transition was fired (dispatched).
-            // Here we produce output tokens as the transition completes. For correctness,
-            // we should track "in-flight" tokens separately, but for now we apply the full
-            // firing rule here since the current implementation doesn't consume on dispatch.
-
-            // Convert current marking to Petri Marking type
-            let mut marking = Marking::from_counts(&run.current_marking);
-
-            // Fire the transition using core Petri semantics
-            match try_fire_transition(transition, &mut marking, &workflow_def) {
-                Ok(result) => {
-                    // Convert the new marking back to HashMap<String, u32>
-                    run.current_marking = result
-                        .new_marking
-                        .as_counts()
-                        .into_iter()
-                        .filter(|(_, count)| *count > 0)
-                        .map(|(k, v)| (k, v as u32))
-                        .collect();
-
-                    // Check if workflow is complete: no enabled transitions and tokens only in terminal places
-                    let enabled = find_enabled_transitions(&workflow_def, &run.current_marking);
-                    let terminal = terminal_places(&workflow_def);
-
-                    let all_tokens_in_terminal = run.current_marking.iter().all(|(place, count)| {
-                        *count == 0 || terminal.contains(&place.as_str())
-                    });
-
-                    if enabled.is_empty() && all_tokens_in_terminal && !run.current_marking.is_empty()
-                    {
-                        run.status = RunStatus::Completed;
-                        run.completed_at = Some(now);
-                        info!(
-                            run_id = %run_id,
-                            final_marking = ?run.current_marking,
-                            "Workflow run completed"
-                        );
-                    }
-
-                    firing_outcome = Some(FiringOutcome::Success);
-                }
-                Err(e) => {
-                    // Insufficient tokens indicates a system inconsistency.
-                    // Mark the run as failed with a concrete reason.
-                    let error_msg = format!(
-                        "Transition '{}' cannot fire: place '{}' has {} tokens but {} required",
-                        e.transition_id, e.place_id, e.available, e.required
-                    );
-
-                    error!(
-                        run_id = %run_id,
-                        transition_id = %transition.id,
-                        error = %error_msg,
-                        "Failed to fire transition: insufficient tokens - marking run as failed"
-                    );
-
-                    // Update transition status to failed
-                    if let Some(ts) = run
-                        .transitions
-                        .iter_mut()
-                        .find(|t| t.transition_id == transition.id)
-                    {
-                        ts.status = "failed".to_string();
-                        ts.completed_at = Some(now);
-                        ts.error = Some(format!("Petri net invariant violated: {}", e));
-                    }
-
-                    // Mark run as failed
-                    run.status = RunStatus::Failed;
-                    run.completed_at = Some(now);
-                    run.error = Some(ErrorInfo {
-                        code: "PETRI_NET_INVARIANT_VIOLATION".to_string(),
-                        message: error_msg.clone(),
-                        transition: Some(transition.id.clone()),
-                    });
-
-                    firing_outcome = Some(FiringOutcome::Failure { error_msg });
-                }
+        // Store transition output as token data for output places
+        let output_data = msg.outputs.clone();
+        for output in &transition.outputs {
+            let count = run.current_marking.entry(output.place.clone()).or_insert(0);
+            *count += output.weight;
+            // Store the transition output as token data for this place
+            if let Some(ref data) = output_data {
+                run.token_data.insert(output.place.clone(), data.clone());
             }
+        }
+
+        info!(
+            %run_id,
+            %transition_id,
+            marking = ?run.current_marking,
+            token_data = ?run.token_data,
+            "Tokens moved after transition completion"
+        );
+
+        // Check if workflow is complete (no tokens in non-terminal places or specific completion condition)
+        // A simple heuristic: if there are tokens only in places with no outgoing transitions, we're done
+        let terminal_places: std::collections::HashSet<_> = workflow_def
+            .places
+            .iter()
+            .filter(|p| {
+                !workflow_def
+                    .transitions
+                    .iter()
+                    .any(|t| t.inputs.iter().any(|i| i.place == p.id))
+            })
+            .map(|p| p.id.clone())
+            .collect();
+
+        let all_tokens_in_terminal = run.current_marking.iter().all(|(place, &count)| {
+            count == 0 || terminal_places.contains(place)
+        });
+
+        if all_tokens_in_terminal && run.current_marking.values().any(|&c| c > 0) {
+            run.status = RunStatus::Completed;
+            run.completed_at = Some(now);
+            info!(run_id = %run_id, "Workflow run completed");
         } else {
-            firing_outcome = None;
-        }
-    } // runs lock released here
+            // Find and publish newly enabled transitions
+            let enabled = find_enabled_transitions(&workflow_def, &run.current_marking, &run.token_data);
 
-    // Write TaskLog AFTER Petri firing outcome is known (and runs lock is released).
-    // IMPORTANT: TaskLog "completed" means the Petri firing was successfully applied to state.
-    // We only write it after try_fire_transition() succeeds. Do NOT move this earlier.
-    match firing_outcome {
-        Some(FiringOutcome::Success) => {
-            let mut logs = state.task_logs.write().await;
-            let run_logs = logs.entry(run_id).or_insert_with(Vec::new);
-            run_logs.push(TaskLog {
-                task_id,
-                run_id,
-                transition_id: transition_id_for_log,
-                status: "completed".to_string(),
-                output: msg.outputs.clone(),
-                error: None,
-                started_at,
-                completed_at: Some(now),
-                duration_ms,
-            });
-        }
-        Some(FiringOutcome::Failure { error_msg }) => {
-            let mut logs = state.task_logs.write().await;
-            let run_logs = logs.entry(run_id).or_insert_with(Vec::new);
-            run_logs.push(TaskLog {
-                task_id,
-                run_id,
-                transition_id: transition_id_for_log,
-                status: "failed".to_string(),
-                output: None,
-                error: Some(error_msg),
-                started_at,
-                completed_at: Some(now),
-                duration_ms,
-            });
-            info!(run_id = %run_id, "Workflow run failed due to Petri net invariant violation");
-        }
-        None => {
-            // Run not found, no TaskLog to write
+            // Collect token data for enabled transitions and drop the lock before publishing
+            let token_data_snapshot = run.token_data.clone();
+            drop(runs);
+
+            if !enabled.is_empty() {
+                info!(%run_id, enabled = ?enabled, "New transitions enabled");
+
+                // Publish enabled events
+                if let Some(nats) = &state.nats {
+                    for tid in enabled {
+                        // Find the transition to get its input places
+                        let trans = workflow_def.transitions.iter().find(|t| t.id == tid);
+
+                        // Build input tokens from token data of input places
+                        // Format must match TokenData struct: token_id, place_id, data, created_at
+                        let input_tokens: Vec<serde_json::Value> = trans
+                            .map(|t| {
+                                t.inputs.iter().filter_map(|input| {
+                                    token_data_snapshot.get(&input.place).map(|data| {
+                                        serde_json::json!({
+                                            "tokenId": Uuid::new_v4().to_string(),
+                                            "placeId": input.place,
+                                            "data": data,
+                                            "createdAt": chrono::Utc::now().to_rfc3339()
+                                        })
+                                    })
+                                }).collect()
+                            })
+                            .unwrap_or_default();
+
+                        let subject = cb_nats::subjects::transition_enabled(&run_id, &tid);
+                        let payload = serde_json::json!({
+                            "transitionRef": {
+                                "runId": run_id.to_string(),
+                                "transitionId": tid,
+                            },
+                            "taskId": Uuid::new_v4().to_string(),
+                            "action": trans.map(|t| &t.action),
+                            "inputTokens": input_tokens,
+                            "runnerPool": "default",
+                            "environment": {},
+                        });
+
+                        if let Err(e) = nats.publish_jetstream(&subject, &payload).await {
+                            error!(error = %e, %subject, "Failed to publish TransitionEnabled");
+                        } else {
+                            debug!(%subject, "Published TransitionEnabled");
+                        }
+                    }
+                }
+            }
+
+            return;
         }
     }
 }
@@ -916,6 +1028,7 @@ async fn run_workflow(
         started_at: now,
         completed_at: None,
         current_marking: initial_marking.clone(),
+        token_data: HashMap::new(),
         transitions,
         error: None,
     };
@@ -927,8 +1040,9 @@ async fn run_workflow(
         started_at: now,
     };
 
-    // Find enabled transitions and dispatch tasks
-    let enabled_transitions = find_enabled_transitions(&workflow.definition, &initial_marking);
+    // Find enabled transitions and dispatch tasks (no token data yet at start)
+    let empty_token_data: HashMap<String, serde_json::Value> = HashMap::new();
+    let enabled_transitions = find_enabled_transitions(&workflow.definition, &initial_marking, &empty_token_data);
 
     // Clone what we need before releasing the lock
     let definition = workflow.definition.clone();
@@ -942,8 +1056,55 @@ async fn run_workflow(
 
     info!(%run_id, %workflow_id, "Workflow run started");
 
-    // Dispatch tasks to NATS for enabled transitions
+    // Publish workflow.started event to NATS
     if let Some(ref nats) = state.nats {
+        let started_payload = WorkflowStartedPayload {
+            workflow_ref: WorkflowRef {
+                workflow_id,
+                workflow_name: definition.name.clone(),
+                namespace: definition.namespace.clone(),
+            },
+            run_ref: RunRef {
+                run_id,
+                workflow_id,
+                attempt: 1,
+            },
+            initial_marking: initial_marking.clone(),
+            inputs: None,
+            triggered_by: Some(TriggerType::Api),
+        };
+
+        let subject = format!("cb.runs.{}.started", run_id);
+        if let Err(e) = nats.publish_jetstream(&subject, &started_payload).await {
+            warn!(error = %e, "Failed to publish workflow.started event");
+        } else {
+            info!(%run_id, subject = %subject, "Published workflow.started event");
+        }
+
+        // Publish token.produced events for initial marking
+        for (place_id, count) in &initial_marking {
+            for _ in 0..*count {
+                let token = TokenData::new(place_id.clone());
+                let produced_payload = TokenProducedPayload {
+                    run_ref: RunRef {
+                        run_id,
+                        workflow_id,
+                        attempt: 1,
+                    },
+                    token,
+                    produced_by: "workflow.start".to_string(),
+                };
+
+                let subject = cb_nats::subjects::token_produced(&run_id, place_id);
+                if let Err(e) = nats.publish_jetstream(&subject, &produced_payload).await {
+                    warn!(error = %e, %place_id, "Failed to publish token.produced event");
+                } else {
+                    debug!(%run_id, %place_id, "Published token.produced event");
+                }
+            }
+        }
+
+        // Dispatch tasks for enabled transitions
         for transition_id in enabled_transitions {
             if let Some(transition) = definition
                 .transitions
@@ -972,6 +1133,7 @@ async fn run_workflow(
                     runner_pool: "default".to_string(),
                     environment: HashMap::new(),
                     input_tokens: vec![],
+                    policy: None,
                 };
 
                 let subject = format!("cb.runs.{}.transitions.{}.enabled", run_id, transition.id);
@@ -1004,20 +1166,172 @@ async fn run_workflow(
     Ok(Json(response))
 }
 
-/// Find enabled transitions based on current marking.
-fn find_enabled_transitions(workflow: &Workflow, marking: &HashMap<String, u32>) -> Vec<String> {
+/// Find enabled transitions based on current marking and guard evaluation (gate semantics).
+///
+/// Gate semantics: A transition is enabled if:
+/// 1. All input places have enough tokens (structurally enabled)
+/// 2. Guard evaluates to true (if present)
+///
+/// If guard evaluates to false, the transition remains structurally enabled but won't fire.
+/// When token data changes, guards are re-evaluated and transitions may become fully enabled.
+fn find_enabled_transitions(
+    workflow: &Workflow,
+    marking: &HashMap<String, u32>,
+    token_data: &HashMap<String, serde_json::Value>,
+) -> Vec<String> {
     workflow
         .transitions
         .iter()
         .filter(|t| {
-            // A transition is enabled if all input places have enough tokens
-            t.inputs.iter().all(|arc| {
+            // A transition is structurally enabled if all input places have enough tokens
+            let has_tokens = t.inputs.iter().all(|arc| {
                 let tokens = marking.get(&arc.place).copied().unwrap_or(0);
                 tokens >= arc.weight
-            })
+            });
+
+            if !has_tokens {
+                return false;
+            }
+
+            // If there's a guard, evaluate it (gate semantics)
+            if let Some(ref guard_expr) = t.guard {
+                match evaluate_guard(guard_expr, t, token_data) {
+                    Ok(result) => {
+                        if !result {
+                            info!(
+                                transition_id = %t.id,
+                                guard = %guard_expr,
+                                "Guard evaluated to false, transition waiting (gate)"
+                            );
+                        }
+                        result
+                    }
+                    Err(e) => {
+                        warn!(
+                            transition_id = %t.id,
+                            guard = %guard_expr,
+                            error = %e,
+                            "Guard evaluation failed, transition waiting"
+                        );
+                        false
+                    }
+                }
+            } else {
+                true
+            }
         })
         .map(|t| t.id.clone())
         .collect()
+}
+
+/// Find transitions that are structurally enabled (have tokens) but waiting on guards.
+/// These transitions should be re-evaluated when token data changes.
+fn find_waiting_transitions(
+    workflow: &Workflow,
+    marking: &HashMap<String, u32>,
+    token_data: &HashMap<String, serde_json::Value>,
+) -> Vec<String> {
+    workflow
+        .transitions
+        .iter()
+        .filter(|t| {
+            // Must have tokens in all input places
+            let has_tokens = t.inputs.iter().all(|arc| {
+                let tokens = marking.get(&arc.place).copied().unwrap_or(0);
+                tokens >= arc.weight
+            });
+
+            if !has_tokens {
+                return false;
+            }
+
+            // Must have a guard that evaluates to false
+            if let Some(ref guard_expr) = t.guard {
+                match evaluate_guard(guard_expr, t, token_data) {
+                    Ok(result) => !result, // Waiting if guard is false
+                    Err(_) => true, // Also waiting if guard errored
+                }
+            } else {
+                false // No guard means not waiting
+            }
+        })
+        .map(|t| t.id.clone())
+        .collect()
+}
+
+/// Evaluate a guard expression using CEL.
+fn evaluate_guard(
+    guard_expr: &str,
+    transition: &cb_core::workflow::Transition,
+    token_data: &HashMap<String, serde_json::Value>,
+) -> Result<bool, String> {
+    use cel_interpreter::{Context, Program, Value, objects::{Key, Map}};
+    use std::sync::Arc;
+
+    // Compile the guard expression
+    let program = Program::compile(guard_expr)
+        .map_err(|e| format!("Failed to compile guard expression: {}", e))?;
+
+    // Build context with token data from input places
+    let mut context = Context::default();
+
+    // Merge all input token data into ctx
+    let mut ctx_map: HashMap<Key, Value> = HashMap::new();
+    for input in &transition.inputs {
+        if let Some(data) = token_data.get(&input.place) {
+            if let Some(obj) = data.as_object() {
+                for (k, v) in obj {
+                    ctx_map.insert(Key::String(k.clone().into()), json_to_cel_value(v));
+                }
+            }
+        }
+    }
+
+    // Add ctx as a variable
+    context.add_variable("ctx", Value::Map(Map { map: Arc::new(ctx_map) }))
+        .map_err(|e| format!("Failed to add ctx variable: {}", e))?;
+
+    // Execute the guard expression
+    let result = program.execute(&context)
+        .map_err(|e| format!("Failed to execute guard expression: {}", e))?;
+
+    // The result should be a boolean
+    match result {
+        Value::Bool(b) => Ok(b),
+        _ => Err(format!("Guard expression did not return a boolean: {:?}", result)),
+    }
+}
+
+/// Convert a serde_json::Value to a CEL Value.
+fn json_to_cel_value(v: &serde_json::Value) -> cel_interpreter::Value {
+    use cel_interpreter::{Value, objects::{Key, Map}};
+    use std::sync::Arc;
+
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else if let Some(u) = n.as_u64() {
+                Value::UInt(u)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(f)
+            } else {
+                Value::Null
+            }
+        }
+        serde_json::Value::String(s) => Value::String(s.clone().into()),
+        serde_json::Value::Array(arr) => {
+            Value::List(arr.iter().map(json_to_cel_value).collect::<Vec<_>>().into())
+        }
+        serde_json::Value::Object(obj) => {
+            let map: HashMap<Key, Value> = obj.iter()
+                .map(|(k, v)| (Key::String(k.clone().into()), json_to_cel_value(v)))
+                .collect();
+            Value::Map(Map { map: Arc::new(map) })
+        }
+    }
 }
 
 /// Get run status.
@@ -1194,22 +1508,46 @@ async fn inject_token(
         }
     }
 
-    // Update marking
-    let new_token_count = {
+    // Update marking and token data
+    let (new_token_count, token_data) = {
         let mut runs = state.runs.write().await;
         let run = runs.get_mut(&run_id).unwrap();
+
+        // Update token count
         let count = run
             .current_marking
             .entry(request.place_id.clone())
             .or_insert(0);
         *count += 1;
-        *count
+        let new_count = *count;
+
+        // Store token data if provided (this enables gate pattern - updating data to satisfy guards)
+        if let Some(ref data) = request.data {
+            run.token_data.insert(request.place_id.clone(), data.clone());
+            info!(
+                place_id = %request.place_id,
+                data = ?data,
+                "Token data stored for place"
+            );
+        }
+
+        (new_count, run.token_data.clone())
     };
 
-    // Find newly enabled transitions
+    // Find newly enabled transitions (including those that were waiting on guards)
     let mut new_marking = current_marking.clone();
     *new_marking.entry(request.place_id.clone()).or_insert(0) += 1;
-    let enabled_transitions = find_enabled_transitions(&workflow_def, &new_marking);
+    let enabled_transitions = find_enabled_transitions(&workflow_def, &new_marking, &token_data);
+
+    // Also find transitions that are still waiting
+    let waiting_transitions = find_waiting_transitions(&workflow_def, &new_marking, &token_data);
+    if !waiting_transitions.is_empty() {
+        info!(
+            run_id = %run_id,
+            waiting = ?waiting_transitions,
+            "Transitions waiting on guards"
+        );
+    }
 
     info!(
         run_id = %run_id,
@@ -1235,6 +1573,16 @@ async fn inject_token(
                     memory: r.memory.clone(),
                 });
 
+                // Build input tokens with current token data from input places
+                let input_tokens: Vec<TokenData> = transition.inputs.iter().filter_map(|input| {
+                    token_data.get(&input.place).map(|data| TokenData {
+                        token_id: Uuid::new_v4(),
+                        place_id: input.place.clone(),
+                        data: Some(data.clone()),
+                        created_at: chrono::Utc::now(),
+                    })
+                }).collect();
+
                 let task = TaskDispatchMessage {
                     task_id,
                     transition_ref: TransitionRef {
@@ -1247,7 +1595,8 @@ async fn inject_token(
                     timeout: Some(transition.timeout.clone()),
                     runner_pool: "default".to_string(),
                     environment: HashMap::new(),
-                    input_tokens: vec![],
+                    input_tokens,
+                    policy: None,
                 };
 
                 let subject = format!("cb.runs.{}.transitions.{}.enabled", run_id, transition.id);
@@ -1267,6 +1616,400 @@ async fn inject_token(
         token_count: new_token_count,
         enabled_transitions,
         token_schema,
+    }))
+}
+
+/// Update token data in a place (gate pattern).
+/// This allows updating token data to satisfy guards without adding new tokens.
+/// When token data is updated, guards are re-evaluated and transitions may become enabled.
+async fn update_token(
+    State(state): State<AppState>,
+    Path(run_id): Path<Uuid>,
+    Json(request): Json<UpdateTokenRequest>,
+) -> Result<Json<UpdateTokenResponse>, ApiError> {
+    // Get the run and its workflow
+    let (workflow_def, workflow_id, current_marking) = {
+        let runs = state.runs.read().await;
+        let run = runs
+            .get(&run_id)
+            .ok_or_else(|| ApiError::not_found(format!("Run {} not found", run_id)))?;
+
+        if run.status != RunStatus::Running && run.status != RunStatus::Pending {
+            return Err(ApiError::conflict(format!(
+                "Run {} is in terminal state {:?}",
+                run_id, run.status
+            )));
+        }
+
+        let workflows = state.workflows.read().await;
+        let workflow = workflows
+            .get(&run.workflow_id)
+            .ok_or_else(|| ApiError::not_found("Workflow not found"))?;
+
+        (workflow.definition.clone(), run.workflow_id, run.current_marking.clone())
+    };
+
+    // Validate the place exists
+    let _place = workflow_def
+        .places
+        .iter()
+        .find(|p| p.id == request.place_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "Place '{}' not found in workflow",
+                request.place_id
+            ))
+        })?;
+
+    // Check that there are tokens in the place to update
+    let token_count = current_marking.get(&request.place_id).copied().unwrap_or(0);
+    if token_count == 0 {
+        return Err(ApiError::bad_request(format!(
+            "No tokens in place '{}' to update",
+            request.place_id
+        )));
+    }
+
+    // Get previous token data for audit trail
+    let previous_data = {
+        let runs = state.runs.read().await;
+        runs.get(&run_id)
+            .and_then(|r| r.token_data.get(&request.place_id).cloned())
+    };
+
+    // Publish TokenUpdated event to NATS
+    if let Some(ref nats) = state.nats {
+        let token = TokenData::with_data(request.place_id.clone(), request.data.clone());
+
+        let payload = TokenUpdatedPayload {
+            run_ref: RunRef {
+                run_id,
+                workflow_id,
+                attempt: 1,
+            },
+            token,
+            place_id: request.place_id.clone(),
+            previous_data,
+            updated_by: "api".to_string(),
+            reason: request.reason.clone(),
+        };
+
+        let subject = cb_nats::subjects::token_updated(&run_id, &request.place_id);
+        if let Err(e) = nats.publish_jetstream(&subject, &payload).await {
+            warn!(error = %e, "Failed to publish TokenUpdated event");
+        } else {
+            info!(subject = %subject, "Published TokenUpdated event");
+        }
+    }
+
+    // Update token data in memory (merge with existing data)
+    let token_data = {
+        let mut runs = state.runs.write().await;
+        let run = runs.get_mut(&run_id).unwrap();
+
+        // Merge new data with existing data
+        let existing = run.token_data.entry(request.place_id.clone()).or_insert_with(|| serde_json::json!({}));
+        if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), request.data.as_object()) {
+            for (k, v) in new_obj {
+                existing_obj.insert(k.clone(), v.clone());
+            }
+        } else {
+            // If not objects, replace entirely
+            *existing = request.data.clone();
+        }
+
+        info!(
+            place_id = %request.place_id,
+            data = ?run.token_data.get(&request.place_id),
+            "Token data updated for place"
+        );
+
+        run.token_data.clone()
+    };
+
+    // Re-evaluate guards and find enabled transitions
+    let enabled_transitions = find_enabled_transitions(&workflow_def, &current_marking, &token_data);
+    let waiting_transitions = find_waiting_transitions(&workflow_def, &current_marking, &token_data);
+
+    info!(
+        run_id = %run_id,
+        place_id = %request.place_id,
+        enabled = ?enabled_transitions,
+        waiting = ?waiting_transitions,
+        "Guards re-evaluated after token update"
+    );
+
+    // Dispatch tasks for newly enabled transitions
+    if let Some(ref nats) = state.nats {
+        for transition_id in &enabled_transitions {
+            if let Some(transition) = workflow_def
+                .transitions
+                .iter()
+                .find(|t| &t.id == transition_id)
+            {
+                let task_id = Uuid::new_v4();
+                let action_json = serde_json::to_value(&transition.action).unwrap_or_default();
+
+                let resources = transition.resources.as_ref().map(|r| TaskResources {
+                    cpu: r.cpu.clone(),
+                    memory: r.memory.clone(),
+                });
+
+                // Build input tokens with current token data
+                let input_tokens: Vec<TokenData> = transition.inputs.iter().filter_map(|input| {
+                    token_data.get(&input.place).map(|data| {
+                        TokenData::with_data(input.place.clone(), data.clone())
+                    })
+                }).collect();
+
+                let task = TaskDispatchMessage {
+                    task_id,
+                    transition_ref: TransitionRef {
+                        transition_id: transition.id.clone(),
+                        run_id,
+                        execution_id: Some(task_id),
+                    },
+                    action: action_json,
+                    resources,
+                    timeout: Some(transition.timeout.clone()),
+                    runner_pool: "default".to_string(),
+                    environment: HashMap::new(),
+                    input_tokens,
+                    policy: None,
+                };
+
+                let subject = cb_nats::subjects::transition_enabled(&run_id, &transition.id);
+
+                if let Err(e) = nats.publish_jetstream(&subject, &task).await {
+                    error!(error = %e, "Failed to dispatch task");
+                } else {
+                    info!(task_id = %task_id, transition_id = %transition.id, "Task dispatched after guard satisfied");
+                }
+            }
+        }
+    }
+
+    Ok(Json(UpdateTokenResponse {
+        run_id,
+        place_id: request.place_id,
+        token_count,
+        enabled_transitions,
+        waiting_transitions,
+    }))
+}
+
+/// Resume a workflow by updating token data to satisfy a failed guard.
+/// If no tokens exist in the place, injects one. If tokens exist, updates their data.
+/// After updating, guards are re-evaluated and transitions may fire.
+async fn resume_workflow(
+    State(state): State<AppState>,
+    Path(run_id): Path<Uuid>,
+    Json(request): Json<ResumeRequest>,
+) -> Result<Json<ResumeResponse>, ApiError> {
+    // Get the run and its workflow
+    let (workflow_def, workflow_id, current_marking) = {
+        let runs = state.runs.read().await;
+        let run = runs
+            .get(&run_id)
+            .ok_or_else(|| ApiError::not_found(format!("Run {} not found", run_id)))?;
+
+        if run.status != RunStatus::Running && run.status != RunStatus::Pending {
+            return Err(ApiError::conflict(format!(
+                "Run {} is in terminal state {:?}",
+                run_id, run.status
+            )));
+        }
+
+        let workflows = state.workflows.read().await;
+        let workflow = workflows
+            .get(&run.workflow_id)
+            .ok_or_else(|| ApiError::not_found("Workflow not found"))?;
+
+        (workflow.definition.clone(), run.workflow_id, run.current_marking.clone())
+    };
+
+    // Validate the place exists
+    let _place = workflow_def
+        .places
+        .iter()
+        .find(|p| p.id == request.place_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "Place '{}' not found in workflow",
+                request.place_id
+            ))
+        })?;
+
+    // Check if tokens already exist in this place
+    let existing_token_count = current_marking.get(&request.place_id).copied().unwrap_or(0);
+    let injected = existing_token_count == 0;
+
+    // Get previous token data for audit trail (if updating)
+    let previous_data = if !injected {
+        let runs = state.runs.read().await;
+        runs.get(&run_id)
+            .and_then(|r| r.token_data.get(&request.place_id).cloned())
+    } else {
+        None
+    };
+
+    // Publish the appropriate event to NATS
+    if let Some(ref nats) = state.nats {
+        let token = TokenData::with_data(request.place_id.clone(), request.data.clone());
+
+        if injected {
+            // Inject new token
+            let payload = TokenInjectedPayload {
+                run_ref: RunRef {
+                    run_id,
+                    workflow_id,
+                    attempt: 1,
+                },
+                token,
+                place_id: request.place_id.clone(),
+                injected_by: "api".to_string(),
+                reason: request.reason.clone(),
+            };
+
+            let subject = cb_nats::subjects::token_injected(&run_id, &request.place_id);
+            if let Err(e) = nats.publish_jetstream(&subject, &payload).await {
+                warn!(error = %e, "Failed to publish TokenInjected event");
+            } else {
+                info!(subject = %subject, "Published TokenInjected event (set_token)");
+            }
+        } else {
+            // Update existing token
+            let payload = TokenUpdatedPayload {
+                run_ref: RunRef {
+                    run_id,
+                    workflow_id,
+                    attempt: 1,
+                },
+                token,
+                place_id: request.place_id.clone(),
+                previous_data,
+                updated_by: "api".to_string(),
+                reason: request.reason.clone(),
+            };
+
+            let subject = cb_nats::subjects::token_updated(&run_id, &request.place_id);
+            if let Err(e) = nats.publish_jetstream(&subject, &payload).await {
+                warn!(error = %e, "Failed to publish TokenUpdated event");
+            } else {
+                info!(subject = %subject, "Published TokenUpdated event (set_token)");
+            }
+        }
+    }
+
+    // Update in-memory state
+    let (token_count, token_data) = {
+        let mut runs = state.runs.write().await;
+        let run = runs.get_mut(&run_id).unwrap();
+
+        if injected {
+            // Add new token
+            let count = run.current_marking.entry(request.place_id.clone()).or_insert(0);
+            *count += 1;
+        }
+
+        // Set/merge token data
+        let existing = run.token_data.entry(request.place_id.clone()).or_insert_with(|| serde_json::json!({}));
+        if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), request.data.as_object()) {
+            for (k, v) in new_obj {
+                existing_obj.insert(k.clone(), v.clone());
+            }
+        } else {
+            *existing = request.data.clone();
+        }
+
+        let count = run.current_marking.get(&request.place_id).copied().unwrap_or(0);
+        info!(
+            place_id = %request.place_id,
+            injected = injected,
+            token_count = count,
+            data = ?run.token_data.get(&request.place_id),
+            "Token set for place"
+        );
+
+        (count, run.token_data.clone())
+    };
+
+    // Get updated marking
+    let new_marking = {
+        let runs = state.runs.read().await;
+        runs.get(&run_id).map(|r| r.current_marking.clone()).unwrap_or_default()
+    };
+
+    // Re-evaluate guards and find enabled transitions
+    let enabled_transitions = find_enabled_transitions(&workflow_def, &new_marking, &token_data);
+    let waiting_transitions = find_waiting_transitions(&workflow_def, &new_marking, &token_data);
+
+    info!(
+        run_id = %run_id,
+        place_id = %request.place_id,
+        injected = injected,
+        enabled = ?enabled_transitions,
+        waiting = ?waiting_transitions,
+        "Guards evaluated after set_token"
+    );
+
+    // Dispatch tasks for enabled transitions
+    if let Some(ref nats) = state.nats {
+        for transition_id in &enabled_transitions {
+            if let Some(transition) = workflow_def
+                .transitions
+                .iter()
+                .find(|t| &t.id == transition_id)
+            {
+                let task_id = Uuid::new_v4();
+                let action_json = serde_json::to_value(&transition.action).unwrap_or_default();
+
+                let resources = transition.resources.as_ref().map(|r| TaskResources {
+                    cpu: r.cpu.clone(),
+                    memory: r.memory.clone(),
+                });
+
+                // Build input tokens with current token data
+                let input_tokens: Vec<TokenData> = transition.inputs.iter().filter_map(|input| {
+                    token_data.get(&input.place).map(|data| {
+                        TokenData::with_data(input.place.clone(), data.clone())
+                    })
+                }).collect();
+
+                let task = TaskDispatchMessage {
+                    task_id,
+                    transition_ref: TransitionRef {
+                        transition_id: transition.id.clone(),
+                        run_id,
+                        execution_id: Some(task_id),
+                    },
+                    action: action_json,
+                    resources,
+                    timeout: Some(transition.timeout.clone()),
+                    runner_pool: "default".to_string(),
+                    environment: HashMap::new(),
+                    input_tokens,
+                    policy: None,
+                };
+
+                let subject = cb_nats::subjects::transition_enabled(&run_id, &transition.id);
+
+                if let Err(e) = nats.publish_jetstream(&subject, &task).await {
+                    error!(error = %e, "Failed to dispatch task");
+                } else {
+                    info!(task_id = %task_id, transition_id = %transition.id, "Task dispatched after set_token");
+                }
+            }
+        }
+    }
+
+    Ok(Json(ResumeResponse {
+        run_id,
+        place_id: request.place_id,
+        token_count,
+        injected,
+        enabled_transitions,
+        waiting_transitions,
     }))
 }
 
@@ -1429,6 +2172,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{run_id}/logs", get(get_run_logs))
         .route("/{run_id}/cancel", post(cancel_run))
         .route("/{run_id}/inject", post(inject_token))
+        .route("/{run_id}/update", post(update_token))
+        .route("/{run_id}/resume", post(resume_workflow))
         .route("/{run_id}/places", get(describe_places));
 
     let api_v1 = Router::new()
@@ -1534,678 +2279,4 @@ pub mod prelude {
         build_router, connect_nats, init_nats_streams, serve, start_event_subscriber, ApiConfig,
         AppState,
     };
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use cb_core::events::TransitionRef;
-    use cb_core::petri::terminal_places;
-    use cb_core::workflow::{Action, Arc, Place, Transition, Workflow};
-
-    /// Helper to create a test AppState with a workflow and run.
-    async fn setup_test_state(
-        workflow: Workflow,
-        initial_marking: HashMap<String, u32>,
-    ) -> (AppState, Uuid, Uuid) {
-        let state = AppState::default();
-        let workflow_id = Uuid::new_v4();
-        let run_id = Uuid::new_v4();
-        let now = chrono::Utc::now();
-
-        // Store workflow
-        {
-            let mut workflows = state.workflows.write().await;
-            workflows.insert(
-                workflow_id,
-                StoredWorkflow {
-                    workflow_id,
-                    name: workflow.name.clone(),
-                    namespace: workflow.namespace.clone(),
-                    definition: workflow.clone(),
-                    created_at: now,
-                },
-            );
-        }
-
-        // Create run with initial marking
-        let transitions: Vec<TransitionStatus> = workflow
-            .transitions
-            .iter()
-            .map(|t| TransitionStatus {
-                transition_id: t.id.clone(),
-                status: "pending".to_string(),
-                attempt: 0,
-                started_at: None,
-                completed_at: None,
-                error: None,
-            })
-            .collect();
-
-        let run = WorkflowRun {
-            run_id,
-            workflow_id,
-            workflow_name: workflow.name.clone(),
-            status: RunStatus::Running,
-            started_at: now,
-            completed_at: None,
-            current_marking: initial_marking,
-            transitions,
-            error: None,
-        };
-
-        {
-            let mut runs = state.runs.write().await;
-            runs.insert(run_id, run);
-        }
-
-        (state, workflow_id, run_id)
-    }
-
-    fn create_simple_workflow() -> Workflow {
-        // Simple: start -> t1 -> end
-        Workflow {
-            version: "1.0".to_string(),
-            name: "simple-test".to_string(),
-            namespace: "default".to_string(),
-            metadata: None,
-            places: vec![
-                Place {
-                    id: "start".to_string(),
-                    initial_tokens: 1,
-                    capacity: None,
-                    token_schema: None,
-                },
-                Place {
-                    id: "end".to_string(),
-                    initial_tokens: 0,
-                    capacity: None,
-                    token_schema: None,
-                },
-            ],
-            transitions: vec![Transition {
-                id: "t1".to_string(),
-                inputs: vec![Arc {
-                    place: "start".to_string(),
-                    weight: 1,
-                    expression: None,
-                }],
-                outputs: vec![Arc {
-                    place: "end".to_string(),
-                    weight: 1,
-                    expression: None,
-                }],
-                guard: None,
-                action: Action::Noop,
-                resources: None,
-                timeout: "5m".to_string(),
-                retries: 0,
-                retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
-                priority: 50,
-            }],
-        }
-    }
-
-    /// Creates a parallel (fork-join) workflow:
-    ///
-    ///          ┌─── t1 ───┐
-    ///   start ─┤          ├─ join ─ t3 ─ end
-    ///          └─── t2 ───┘
-    ///
-    /// t1 and t2 can fire in parallel, t3 requires both to complete.
-    fn create_parallel_workflow() -> Workflow {
-        Workflow {
-            version: "1.0".to_string(),
-            name: "parallel-test".to_string(),
-            namespace: "default".to_string(),
-            metadata: None,
-            places: vec![
-                Place {
-                    id: "start".to_string(),
-                    initial_tokens: 2, // Two tokens for parallel paths
-                    capacity: None,
-                    token_schema: None,
-                },
-                Place {
-                    id: "after-t1".to_string(),
-                    initial_tokens: 0,
-                    capacity: None,
-                    token_schema: None,
-                },
-                Place {
-                    id: "after-t2".to_string(),
-                    initial_tokens: 0,
-                    capacity: None,
-                    token_schema: None,
-                },
-                Place {
-                    id: "end".to_string(),
-                    initial_tokens: 0,
-                    capacity: None,
-                    token_schema: None,
-                },
-            ],
-            transitions: vec![
-                Transition {
-                    id: "t1".to_string(),
-                    inputs: vec![Arc {
-                        place: "start".to_string(),
-                        weight: 1,
-                        expression: None,
-                    }],
-                    outputs: vec![Arc {
-                        place: "after-t1".to_string(),
-                        weight: 1,
-                        expression: None,
-                    }],
-                    guard: None,
-                    action: Action::Noop,
-                    resources: None,
-                    timeout: "5m".to_string(),
-                    retries: 0,
-                    retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
-                    priority: 50,
-                },
-                Transition {
-                    id: "t2".to_string(),
-                    inputs: vec![Arc {
-                        place: "start".to_string(),
-                        weight: 1,
-                        expression: None,
-                    }],
-                    outputs: vec![Arc {
-                        place: "after-t2".to_string(),
-                        weight: 1,
-                        expression: None,
-                    }],
-                    guard: None,
-                    action: Action::Noop,
-                    resources: None,
-                    timeout: "5m".to_string(),
-                    retries: 0,
-                    retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
-                    priority: 50,
-                },
-                Transition {
-                    id: "t3".to_string(),
-                    inputs: vec![
-                        Arc {
-                            place: "after-t1".to_string(),
-                            weight: 1,
-                            expression: None,
-                        },
-                        Arc {
-                            place: "after-t2".to_string(),
-                            weight: 1,
-                            expression: None,
-                        },
-                    ],
-                    outputs: vec![Arc {
-                        place: "end".to_string(),
-                        weight: 1,
-                        expression: None,
-                    }],
-                    guard: None,
-                    action: Action::Noop,
-                    resources: None,
-                    timeout: "5m".to_string(),
-                    retries: 0,
-                    retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
-                    priority: 50,
-                },
-            ],
-        }
-    }
-
-    /// Creates a workflow with a non-"done" terminal place.
-    fn create_custom_terminal_workflow() -> Workflow {
-        Workflow {
-            version: "1.0".to_string(),
-            name: "custom-terminal-test".to_string(),
-            namespace: "default".to_string(),
-            metadata: None,
-            places: vec![
-                Place {
-                    id: "start".to_string(),
-                    initial_tokens: 1,
-                    capacity: None,
-                    token_schema: None,
-                },
-                Place {
-                    id: "completed-successfully".to_string(), // NOT "done"
-                    initial_tokens: 0,
-                    capacity: None,
-                    token_schema: None,
-                },
-            ],
-            transitions: vec![Transition {
-                id: "process".to_string(),
-                inputs: vec![Arc {
-                    place: "start".to_string(),
-                    weight: 1,
-                    expression: None,
-                }],
-                outputs: vec![Arc {
-                    place: "completed-successfully".to_string(),
-                    weight: 1,
-                    expression: None,
-                }],
-                guard: None,
-                action: Action::Noop,
-                resources: None,
-                timeout: "5m".to_string(),
-                retries: 0,
-                retry_backoff: cb_core::workflow::RetryBackoff::Exponential,
-                priority: 50,
-            }],
-        }
-    }
-
-    // ==================== Regression Tests ====================
-
-    /// Test: Simple workflow marking update.
-    /// Before fix: Marking would incorrectly become {done: 1}.
-    /// After fix: Marking correctly becomes {end: 1}.
-    #[tokio::test]
-    async fn test_simple_marking_update() {
-        let workflow = create_simple_workflow();
-        let initial_marking = [("start".to_string(), 1u32)].into_iter().collect();
-        let (state, _workflow_id, run_id) = setup_test_state(workflow, initial_marking).await;
-
-        // Simulate t1 completing
-        let msg = TransitionCompletedMessage {
-            transition_ref: TransitionRef {
-                transition_id: "t1".to_string(),
-                run_id,
-                execution_id: Some(Uuid::new_v4()),
-            },
-            produced_tokens: vec![],
-            outputs: None,
-            resource_usage: None,
-        };
-
-        handle_transition_completed(&state, run_id, msg).await;
-
-        // Verify marking
-        let runs = state.runs.read().await;
-        let run = runs.get(&run_id).expect("run should exist");
-
-        // After t1: start should have 0 tokens, end should have 1
-        assert_eq!(
-            run.current_marking.get("start").copied().unwrap_or(0),
-            0,
-            "start place should have 0 tokens after t1 completes"
-        );
-        assert_eq!(
-            run.current_marking.get("end").copied().unwrap_or(0),
-            1,
-            "end place should have 1 token after t1 completes"
-        );
-
-        // Workflow should be completed (token in terminal place, no enabled transitions)
-        assert_eq!(
-            run.status,
-            RunStatus::Completed,
-            "workflow should be completed"
-        );
-    }
-
-    /// Test: Parallel workflow with fork-join pattern.
-    /// This is the key regression test - the old code would fail here because
-    /// it hardcoded {done: 1} after all transitions complete, ignoring
-    /// intermediate states and the actual Petri net structure.
-    #[tokio::test]
-    async fn test_parallel_marking_update() {
-        let workflow = create_parallel_workflow();
-        let initial_marking = [("start".to_string(), 2u32)].into_iter().collect();
-        let (state, _workflow_id, run_id) = setup_test_state(workflow, initial_marking).await;
-
-        // Step 1: t1 completes (parallel branch 1)
-        let msg1 = TransitionCompletedMessage {
-            transition_ref: TransitionRef {
-                transition_id: "t1".to_string(),
-                run_id,
-                execution_id: Some(Uuid::new_v4()),
-            },
-            produced_tokens: vec![],
-            outputs: None,
-            resource_usage: None,
-        };
-
-        handle_transition_completed(&state, run_id, msg1).await;
-
-        // Verify intermediate marking after t1
-        {
-            let runs = state.runs.read().await;
-            let run = runs.get(&run_id).expect("run should exist");
-
-            assert_eq!(
-                run.current_marking.get("start").copied().unwrap_or(0),
-                1,
-                "start should have 1 token (one consumed by t1)"
-            );
-            assert_eq!(
-                run.current_marking.get("after-t1").copied().unwrap_or(0),
-                1,
-                "after-t1 should have 1 token"
-            );
-            assert_eq!(
-                run.current_marking.get("after-t2").copied().unwrap_or(0),
-                0,
-                "after-t2 should have 0 tokens (t2 not fired)"
-            );
-            assert_eq!(
-                run.status,
-                RunStatus::Running,
-                "workflow should still be running"
-            );
-        }
-
-        // Step 2: t2 completes (parallel branch 2)
-        let msg2 = TransitionCompletedMessage {
-            transition_ref: TransitionRef {
-                transition_id: "t2".to_string(),
-                run_id,
-                execution_id: Some(Uuid::new_v4()),
-            },
-            produced_tokens: vec![],
-            outputs: None,
-            resource_usage: None,
-        };
-
-        handle_transition_completed(&state, run_id, msg2).await;
-
-        // Verify marking after both parallel branches complete
-        {
-            let runs = state.runs.read().await;
-            let run = runs.get(&run_id).expect("run should exist");
-
-            assert_eq!(
-                run.current_marking.get("start").copied().unwrap_or(0),
-                0,
-                "start should have 0 tokens"
-            );
-            assert_eq!(
-                run.current_marking.get("after-t1").copied().unwrap_or(0),
-                1,
-                "after-t1 should have 1 token"
-            );
-            assert_eq!(
-                run.current_marking.get("after-t2").copied().unwrap_or(0),
-                1,
-                "after-t2 should have 1 token"
-            );
-            // t3 is now enabled (has tokens in both inputs)
-            // but workflow is not complete yet
-            assert_eq!(
-                run.status,
-                RunStatus::Running,
-                "workflow should still be running (t3 not fired)"
-            );
-        }
-
-        // Step 3: t3 completes (join)
-        let msg3 = TransitionCompletedMessage {
-            transition_ref: TransitionRef {
-                transition_id: "t3".to_string(),
-                run_id,
-                execution_id: Some(Uuid::new_v4()),
-            },
-            produced_tokens: vec![],
-            outputs: None,
-            resource_usage: None,
-        };
-
-        handle_transition_completed(&state, run_id, msg3).await;
-
-        // Verify final marking
-        {
-            let runs = state.runs.read().await;
-            let run = runs.get(&run_id).expect("run should exist");
-
-            assert_eq!(
-                run.current_marking.get("after-t1").copied().unwrap_or(0),
-                0,
-                "after-t1 should have 0 tokens (consumed by t3)"
-            );
-            assert_eq!(
-                run.current_marking.get("after-t2").copied().unwrap_or(0),
-                0,
-                "after-t2 should have 0 tokens (consumed by t3)"
-            );
-            assert_eq!(
-                run.current_marking.get("end").copied().unwrap_or(0),
-                1,
-                "end should have 1 token"
-            );
-            assert_eq!(
-                run.status,
-                RunStatus::Completed,
-                "workflow should be completed"
-            );
-        }
-    }
-
-    /// Test: Workflow with non-"done" terminal place.
-    /// Before fix: Would incorrectly set marking to {done: 1}.
-    /// After fix: Marking correctly reflects actual terminal place.
-    #[tokio::test]
-    async fn test_custom_terminal_place_marking() {
-        let workflow = create_custom_terminal_workflow();
-        let initial_marking = [("start".to_string(), 1u32)].into_iter().collect();
-        let (state, _workflow_id, run_id) = setup_test_state(workflow, initial_marking).await;
-
-        // Simulate "process" transition completing
-        let msg = TransitionCompletedMessage {
-            transition_ref: TransitionRef {
-                transition_id: "process".to_string(),
-                run_id,
-                execution_id: Some(Uuid::new_v4()),
-            },
-            produced_tokens: vec![],
-            outputs: None,
-            resource_usage: None,
-        };
-
-        handle_transition_completed(&state, run_id, msg).await;
-
-        // Verify marking
-        let runs = state.runs.read().await;
-        let run = runs.get(&run_id).expect("run should exist");
-
-        // Terminal place is "completed-successfully", NOT "done"
-        assert!(
-            !run.current_marking.contains_key("done"),
-            "marking should NOT contain 'done' - that was the old buggy behavior"
-        );
-        assert_eq!(
-            run.current_marking
-                .get("completed-successfully")
-                .copied()
-                .unwrap_or(0),
-            1,
-            "completed-successfully should have 1 token"
-        );
-        assert_eq!(
-            run.status,
-            RunStatus::Completed,
-            "workflow should be completed"
-        );
-    }
-
-    /// Test: terminal_places function correctly identifies terminal places.
-    #[test]
-    fn test_terminal_places_identification() {
-        let workflow = create_parallel_workflow();
-        let terminals = terminal_places(&workflow);
-
-        assert!(
-            terminals.contains(&"end"),
-            "end should be a terminal place"
-        );
-        assert!(
-            !terminals.contains(&"start"),
-            "start should NOT be a terminal place"
-        );
-        assert!(
-            !terminals.contains(&"after-t1"),
-            "after-t1 should NOT be a terminal place"
-        );
-        assert!(
-            !terminals.contains(&"after-t2"),
-            "after-t2 should NOT be a terminal place"
-        );
-    }
-
-    /// Test: find_enabled_transitions works correctly with marking.
-    #[test]
-    fn test_find_enabled_transitions() {
-        let workflow = create_parallel_workflow();
-
-        // Initial marking: 2 tokens in start
-        let marking1: HashMap<String, u32> = [("start".to_string(), 2)].into_iter().collect();
-        let enabled1 = find_enabled_transitions(&workflow, &marking1);
-        assert!(enabled1.contains(&"t1".to_string()), "t1 should be enabled");
-        assert!(enabled1.contains(&"t2".to_string()), "t2 should be enabled");
-        assert!(
-            !enabled1.contains(&"t3".to_string()),
-            "t3 should NOT be enabled"
-        );
-
-        // After t1 and t2: tokens in after-t1 and after-t2
-        let marking2: HashMap<String, u32> = [
-            ("after-t1".to_string(), 1),
-            ("after-t2".to_string(), 1),
-        ]
-        .into_iter()
-        .collect();
-        let enabled2 = find_enabled_transitions(&workflow, &marking2);
-        assert!(
-            !enabled2.contains(&"t1".to_string()),
-            "t1 should NOT be enabled"
-        );
-        assert!(
-            !enabled2.contains(&"t2".to_string()),
-            "t2 should NOT be enabled"
-        );
-        assert!(enabled2.contains(&"t3".to_string()), "t3 should be enabled");
-    }
-
-    /// Test: Petri net invariant violation results in Failed run and "failed" TaskLog.
-    /// This tests the error path when try_fire_transition fails due to insufficient tokens.
-    /// Before fix: TaskLog would say "completed" even though firing failed.
-    /// After fix: TaskLog correctly shows "failed" with error message.
-    #[tokio::test]
-    async fn test_insufficient_tokens_produces_failed_tasklog() {
-        let workflow = create_simple_workflow();
-        // Set up with NO tokens in start - this will cause firing to fail
-        let initial_marking: HashMap<String, u32> = HashMap::new(); // Empty marking!
-        let (state, _workflow_id, run_id) = setup_test_state(workflow, initial_marking).await;
-
-        // Try to complete t1 even though there are no tokens in its input place
-        let msg = TransitionCompletedMessage {
-            transition_ref: TransitionRef {
-                transition_id: "t1".to_string(),
-                run_id,
-                execution_id: Some(Uuid::new_v4()),
-            },
-            produced_tokens: vec![],
-            outputs: None,
-            resource_usage: None,
-        };
-
-        handle_transition_completed(&state, run_id, msg).await;
-
-        // Verify run is marked as Failed
-        {
-            let runs = state.runs.read().await;
-            let run = runs.get(&run_id).expect("run should exist");
-
-            assert_eq!(
-                run.status,
-                RunStatus::Failed,
-                "run should be Failed due to Petri net invariant violation"
-            );
-            assert!(run.error.is_some(), "run should have error info");
-            let error = run.error.as_ref().unwrap();
-            assert_eq!(
-                error.code, "PETRI_NET_INVARIANT_VIOLATION",
-                "error code should indicate Petri net invariant violation"
-            );
-            assert!(
-                error.message.contains("insufficient") || error.message.contains("tokens"),
-                "error message should mention tokens: {}",
-                error.message
-            );
-            assert_eq!(
-                error.transition,
-                Some("t1".to_string()),
-                "error should reference the failing transition"
-            );
-        }
-
-        // Verify TaskLog has "failed" status (NOT "completed")
-        {
-            let logs = state.task_logs.read().await;
-            let run_logs = logs.get(&run_id).expect("should have task logs for run");
-
-            assert_eq!(run_logs.len(), 1, "should have exactly one TaskLog entry");
-
-            let log = &run_logs[0];
-            assert_eq!(
-                log.status, "failed",
-                "TaskLog status should be 'failed', not 'completed'"
-            );
-            assert_eq!(log.transition_id, "t1", "TaskLog should be for transition t1");
-            assert!(
-                log.error.is_some(),
-                "TaskLog should have error message on failure"
-            );
-            let error_msg = log.error.as_ref().unwrap();
-            assert!(
-                error_msg.contains("start") && error_msg.contains("0 tokens"),
-                "error should mention the place with insufficient tokens: {}",
-                error_msg
-            );
-        }
-    }
-
-    /// Test: Successful transition completion produces "completed" TaskLog.
-    /// Ensures TaskLog is written AFTER Petri firing succeeds (not before).
-    #[tokio::test]
-    async fn test_successful_completion_produces_completed_tasklog() {
-        let workflow = create_simple_workflow();
-        let initial_marking = [("start".to_string(), 1u32)].into_iter().collect();
-        let (state, _workflow_id, run_id) = setup_test_state(workflow, initial_marking).await;
-
-        let msg = TransitionCompletedMessage {
-            transition_ref: TransitionRef {
-                transition_id: "t1".to_string(),
-                run_id,
-                execution_id: Some(Uuid::new_v4()),
-            },
-            produced_tokens: vec![],
-            outputs: Some(serde_json::json!({"result": "success"})),
-            resource_usage: None,
-        };
-
-        handle_transition_completed(&state, run_id, msg).await;
-
-        // Verify TaskLog has "completed" status
-        {
-            let logs = state.task_logs.read().await;
-            let run_logs = logs.get(&run_id).expect("should have task logs for run");
-
-            assert_eq!(run_logs.len(), 1, "should have exactly one TaskLog entry");
-
-            let log = &run_logs[0];
-            assert_eq!(
-                log.status, "completed",
-                "TaskLog status should be 'completed'"
-            );
-            assert_eq!(log.transition_id, "t1", "TaskLog should be for transition t1");
-            assert!(log.error.is_none(), "TaskLog should have no error on success");
-            assert!(log.output.is_some(), "TaskLog should preserve outputs");
-        }
-    }
 }

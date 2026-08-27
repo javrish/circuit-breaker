@@ -102,21 +102,6 @@ impl Marking {
         marking
     }
 
-    /// Create a marking from a simple count map.
-    ///
-    /// This is useful when reconstructing a Marking from stored state
-    /// (e.g., from a database or API response that only stores counts).
-    #[must_use]
-    pub fn from_counts(counts: &HashMap<String, u32>) -> Self {
-        let mut marking = Self::new();
-        for (place_id, count) in counts {
-            for _ in 0..*count {
-                marking.add_token(Token::new(place_id));
-            }
-        }
-        marking
-    }
-
     /// Add a token to the marking.
     pub fn add_token(&mut self, token: Token) {
         self.places
@@ -213,9 +198,7 @@ impl Marking {
 
 /// Re-export workflow types as Petri net primitives.
 pub type Place = workflow::Place;
-/// A Petri net transition (re-exported from workflow).
 pub type Transition = workflow::Transition;
-/// A Petri net arc connecting places and transitions (re-exported from workflow).
 pub type Arc = workflow::Arc;
 
 /// Result of checking if a transition is enabled.
@@ -342,83 +325,6 @@ pub fn fire_transition(
     }
 }
 
-/// Error returned when a transition cannot be fired.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FiringError {
-    /// The transition that failed to fire.
-    pub transition_id: String,
-    /// The place with insufficient tokens.
-    pub place_id: String,
-    /// Number of tokens required.
-    pub required: u32,
-    /// Number of tokens available.
-    pub available: usize,
-}
-
-impl std::fmt::Display for FiringError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Transition '{}' cannot fire: place '{}' has {} tokens but {} required",
-            self.transition_id, self.place_id, self.available, self.required
-        )
-    }
-}
-
-impl std::error::Error for FiringError {}
-
-/// Fire a transition, returning an error if insufficient tokens.
-///
-/// This is the fallible version of `fire_transition()`. Use this when you
-/// need to handle insufficient tokens gracefully (e.g., in async handlers
-/// where panicking is undesirable).
-///
-/// # Errors
-///
-/// Returns `FiringError` if any input place has fewer tokens than required
-/// by the arc weight.
-pub fn try_fire_transition(
-    transition: &Transition,
-    marking: &mut Marking,
-    _workflow: &workflow::Workflow,
-) -> Result<FiringResult, FiringError> {
-    // First, check that all input places have sufficient tokens
-    for input_arc in &transition.inputs {
-        let available = marking.token_count(&input_arc.place);
-        if available < input_arc.weight as usize {
-            return Err(FiringError {
-                transition_id: transition.id.clone(),
-                place_id: input_arc.place.clone(),
-                required: input_arc.weight,
-                available,
-            });
-        }
-    }
-
-    // All checks passed, now consume and produce
-    let mut consumed_tokens = Vec::new();
-    let mut produced_tokens = Vec::new();
-
-    for input_arc in &transition.inputs {
-        let tokens = marking.remove_many(&input_arc.place, input_arc.weight as usize);
-        consumed_tokens.extend(tokens);
-    }
-
-    for output_arc in &transition.outputs {
-        for _ in 0..output_arc.weight {
-            let token = Token::new(&output_arc.place).produced_by(&transition.id);
-            marking.add_token(token.clone());
-            produced_tokens.push(token);
-        }
-    }
-
-    Ok(FiringResult {
-        consumed_tokens,
-        produced_tokens,
-        new_marking: marking.clone(),
-    })
-}
-
 /// Compute the set of reachable places from places with initial tokens.
 #[must_use]
 pub fn reachable_places(workflow: &workflow::Workflow) -> HashSet<String> {
@@ -452,11 +358,7 @@ pub fn reachable_places(workflow: &workflow::Workflow) -> HashSet<String> {
     reachable
 }
 
-/// Find terminal places (derived as places that are not an input to any transition).
-///
-/// A place is considered terminal if no transition consumes tokens from it.
-/// This is a derived definition based on workflow topology, not an explicit
-/// "end" marker in the workflow schema.
+/// Find terminal places (places with no outgoing transitions).
 #[must_use]
 pub fn terminal_places(workflow: &workflow::Workflow) -> Vec<&str> {
     let places_with_outgoing: HashSet<_> = workflow
@@ -507,12 +409,14 @@ mod tests {
                     initial_tokens: 1,
                     capacity: None,
                     token_schema: None,
+                    annotations: Default::default(),
                 },
                 workflow::Place {
                     id: "p2".to_string(),
                     initial_tokens: 0,
                     capacity: None,
                     token_schema: None,
+                    annotations: Default::default(),
                 },
             ],
             transitions: vec![workflow::Transition {
@@ -529,11 +433,13 @@ mod tests {
                 }],
                 guard: None,
                 action: Action::Noop,
+                policy: None,
                 resources: None,
                 timeout: "5m".to_string(),
                 retries: 0,
                 retry_backoff: workflow::RetryBackoff::Exponential,
                 priority: 50,
+                annotations: Default::default(),
             }],
         }
     }
